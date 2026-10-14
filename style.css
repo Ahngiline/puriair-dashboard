@@ -1079,3 +1079,47 @@ button { font-family: inherit; }
   color: #b84d24 !important;
   font-weight: 700;
 }
+
+/* =========================================================
+   v13 — UNKNOWN state (0 reading) always renders critical/red
+   ========================================================= */
+.condition-box.unknown,
+.condition-row.unknown td,
+.telemetry.condition-box.unknown,
+.metric-telemetry.unknown {
+  background: #fde7e7 !important;
+  border-color: #df7777 !important;
+  color: #8a1a1a;
+}
+.status-chip.unknown,
+.status-chip.critical {
+  background: #c93b3b;
+  color: #fff;
+}
+.condition-arrow.unknown {
+  color: #c93b3b;
+}
+.value-danger {
+  color: #b12c2c;
+  font-weight: 800;
+}
+.room-card.device-offline.condition-box.unknown {
+  opacity: 0.85;
+}
+
+/* =========================================================
+   v13 — Logo images (moved out of inline styles)
+   ========================================================= */
+.brand-mark img {
+  width: 32px;
+  height: 32px;
+  object-fit: contain;
+  display: block;
+}
+
+.project-mark img {
+  width: 110px;
+  height: 110px;
+  object-fit: contain;
+  display: block;
+}
