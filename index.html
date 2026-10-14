@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <meta name="theme-color" content="#7b1113" />
   <title>PuriAir | Indoor Air Quality Analytics</title>
-  <link rel="stylesheet" href="style.css?v=3" />
+  <link rel="stylesheet" href="style.css?v=16" />
   <link rel="icon" href="data:,">
 </head>
 <body class="student-role">
@@ -49,7 +49,6 @@
         </div>
       </header>
 
-      <!-- ==================== STALE DATA BANNER ==================== -->
       <div class="stale-banner hidden" id="staleBanner"></div>
 
       <!-- ==================== PAGE: PURIAIR ==================== -->
@@ -88,7 +87,7 @@
           <div>
             <span class="section-kicker">PROJECT RESEARCH</span>
             <h4>PuriAir: an IoT Multi-Classroom Air Quality Analytics Platform with Occupancy-Driven Predictive Purification</h4>
-            <p>This section is reserved for the final researcher profiles, affiliations, photographs, research roles, and contact details. The researcher information below is currently a placeholder for the project prototype.</p>
+            <p>This section is reserved for the final researcher profiles, affiliations, photographs, research roles, and contact details.</p>
           </div>
         </section>
         <section class="researcher-grid">
@@ -151,7 +150,13 @@
                 <h4 id="detailRoomTitle">—</h4>
                 <span class="student-purifier-activity student-only" id="studentPurifierActivity"><i></i> PURIFIER —</span>
               </div>
-              <div class="chi-status-wrap"><strong id="detailCHI">--</strong><span>/ 100</span><span class="status-chip safe" id="detailStatus">—</span></div>
+              <div class="chi-status-wrap">
+                <button type="button" class="chi-bubble-btn" id="chiBubbleBtn" aria-label="Show CHI scale and breakdown">
+                  <strong id="detailCHI">--</strong>
+                  <span>/ 100</span>
+                </button>
+                <span class="status-chip unknown" id="detailStatus">—</span>
+              </div>
             </div>
             <div class="condition-meter" id="conditionMeter">
               <div class="condition-meter-top"><span>Current Metric Condition</span><strong id="conditionMeterValue">—</strong></div>
@@ -161,7 +166,7 @@
               </div>
               <div class="condition-meter-scale"><span>Critical</span><span>Poor</span><span>Moderate</span><span>Safe</span></div>
               <div class="condition-meter-caption"><span id="conditionMeterCaption">SELECT A METRIC</span><strong id="detailMetricName">—</strong></div>
-              <div class="selected-metric-status"><span>Selected metric</span><strong id="detailMetricNameMirror">—</strong><span class="status-chip safe" id="detailMetricStatus">—</span></div>
+              <div class="selected-metric-status"><span>Selected metric</span><strong id="detailMetricNameMirror">—</strong><span class="status-chip unknown" id="detailMetricStatus">—</span></div>
             </div>
             <div class="telemetry-grid focused-telemetry-grid" id="detailTelemetry"></div>
           </article>
@@ -222,7 +227,6 @@
           </aside>
         </section>
 
-        <!-- Classroom Management Modal -->
         <div class="modal-backdrop hidden" id="classroomModal" role="dialog" aria-modal="true" aria-labelledby="classroomModalTitle">
           <div class="classroom-modal">
             <div class="modal-header">
@@ -237,37 +241,51 @@
             </div>
             <div id="removeClassroomForm" class="modal-form hidden">
               <label>Active classroom<select id="removeClassroomSelect"></select></label>
-              <p class="modal-hint">Only currently active monitored classrooms are available for removal. Removing a classroom releases its PuriAir device back to the available pool.</p>
+              <p class="modal-hint">Only currently active monitored classrooms are available for removal.</p>
               <div class="modal-actions"><button class="secondary-button" id="cancelRemoveClassroom">Cancel</button><button class="danger-button" id="confirmRemoveClassroom">Remove Classroom</button></div>
             </div>
           </div>
         </div>
+
+        <!-- CHI Scale Modal -->
+        <div class="modal-backdrop hidden" id="chiModal" role="dialog" aria-modal="true" aria-labelledby="chiModalTitle">
+          <div class="classroom-modal chi-modal">
+            <div class="modal-header">
+              <div>
+                <span class="section-kicker">CLASSROOM HEALTH INDEX</span>
+                <h4 id="chiModalTitle">How CHI is computed</h4>
+              </div>
+              <button class="modal-close" id="closeChiModal" aria-label="Close">×</button>
+            </div>
+            <div id="chiModalBody"></div>
+          </div>
+        </div>
       </div>
 
-      <!-- ==================== PAGE: SENSORS (ADMIN) ==================== -->
+      <!-- ==================== PAGE: SENSORS ==================== -->
       <div class="content hidden admin-page" id="page-sensors">
         <section class="hero-row">
           <div><p class="section-kicker">DEVICE HEALTH MONITORING</p><h3>Sensor Status</h3><p class="section-description">Check the ESP32 controller and sensor-input availability for the selected classroom.</p></div>
           <label class="sensor-room-select">Monitored classroom<select id="sensorRoomSelect" aria-label="Select classroom for sensor status"></select></label>
         </section>
-        <div class="sensor-demo-notice"><strong>Live data:</strong> These indicators reflect the latest ESP32 telemetry in Firebase.</div>
+        <div class="sensor-demo-notice"><strong>Live data:</strong> These indicators reflect the latest ESP32 telemetry in Firebase. A sensor with no reading is shown as UNKNOWN.</div>
         <section class="sensor-summary-grid" id="sensorSummary"></section>
         <section class="panel sensor-table-panel">
           <div class="panel-header"><div><span class="section-kicker">INPUT VALIDATION</span><h4>Sensor Diagnostics</h4></div><span class="management-note" id="sensorCheckedAt">—</span></div>
           <div class="sensor-diagnostics-list" id="sensorDiagnostics"></div>
         </section>
         <section class="panel sensor-table-panel uptime-panel">
-          <div class="panel-header"><div><span class="section-kicker">AVAILABILITY HISTORY</span><h4>Sensor Uptime Logs</h4></div><span class="management-note">Per classroom · browser-recorded</span></div>
-          <p class="management-note">Uptime begins when this page first observes a sensor. Logs are stored in this browser and are not a substitute for device-side logs; downtime while the website is closed cannot be reconstructed.</p>
+          <div class="panel-header"><div><span class="section-kicker">AVAILABILITY HISTORY</span><h4>Sensor Uptime Logs</h4></div><span class="management-note">Per classroom</span></div>
+          <p class="management-note">Uptime tracking is disabled in this version. Only real Firebase telemetry is displayed above.</p>
           <div id="sensorUptimeSummary" class="sensor-summary-grid"></div>
           <div id="sensorUptimeHistory" class="sensor-diagnostics-list"></div>
         </section>
       </div>
 
-      <!-- ==================== PAGE: PURIFIER & FILTER MAINTENANCE (ADMIN) ==================== -->
+      <!-- ==================== PAGE: PURIFIER ==================== -->
       <div class="content hidden admin-page" id="page-purifier">
         <section class="hero-row"><div><p class="section-kicker">DEVICE OPERATIONS & MAINTENANCE</p><h3>Purifier</h3><p class="section-description">Monitor purifier subsystems, maintain water-level records, and track filter condition and service dates.</p></div><label class="sensor-room-select">Assigned classroom<select id="purifierRoomSelect" aria-label="Select classroom for purifier"></select></label></section>
-        <div class="sensor-demo-notice"><strong>Live data:</strong> Fan and module states come from ESP32 telemetry. Tank level and Peltier status are manual records until wired to sensors.</div>
+        <div class="sensor-demo-notice"><strong>Live data:</strong> Fan and module states come from ESP32 telemetry. Tank level and Peltier status are shown only when the ESP32 reports them.</div>
         <section class="sensor-summary-grid" id="purifierSummary"></section>
         <section class="panel sensor-table-panel"><div class="panel-header"><div><span class="section-kicker">FILTER SERVICE</span><h4>Filter Replacement Log</h4></div></div>
           <form id="filterLogForm" class="maintenance-form">
@@ -283,18 +301,18 @@
         </section>
       </div>
 
-      <!-- ==================== PAGE: DATABASE (ADMIN) ==================== -->
+      <!-- ==================== PAGE: DATABASE ==================== -->
       <div class="content hidden admin-page" id="page-database">
         <section class="hero-row">
           <div>
             <p class="section-kicker">DATA ARCHIVE & EXPORT</p>
             <h3>Database Logs</h3>
-            <p class="section-description">Download 10-day environmental telemetry logs for a selected classroom. Each 10-day block is stored as a separate database chunk to minimize memory usage.</p>
+            <p class="section-description">Download a single day of environmental telemetry for a selected classroom. Only the current month is retained.</p>
           </div>
         </section>
 
         <div class="sensor-demo-notice">
-          <strong>Prototype notice:</strong> This panel currently generates/downloads logs from the browser's simulated telemetry. Once Firebase telemetry and the 10-day chunking backend are connected, this panel will query the real database chunks directly.
+          <strong>Live data:</strong> Logs are fetched from Firebase <code>/devices/&lt;deviceId&gt;/readings/</code>. Each row is a real 5-second sample recorded by the PuriAir device. Only the current month is available.
         </div>
 
         <section class="panel database-panel">
@@ -303,36 +321,18 @@
           </div>
           <form id="databaseExportForm" class="database-form">
             <label>Classroom<select id="databaseRoomSelect" required></select></label>
-            <label>Date within target 10-day block<input type="date" id="databaseDate" required /></label>
+            <label>Date (current month only)<input type="date" id="databaseDate" required /></label>
             <label>Format<select id="databaseFormat"><option value="xls">Excel (.xls)</option></select></label>
             <div class="database-wide"><button type="submit" class="primary-button">⤓ Download Log</button></div>
           </form>
           <div id="databaseBlockInfo" class="database-block-info"></div>
         </section>
-
-        <section class="panel">
-          <div class="panel-header">
-            <div><span class="section-kicker">AVAILABLE 10-DAY BLOCKS</span><h4>Stored Telemetry Chunks</h4></div>
-            <span class="management-note" id="databaseBlockCount">0 blocks</span>
-          </div>
-          <div id="databaseBlockList" class="database-block-list"></div>
-        </section>
       </div>
 
-      <!-- ==================== PAGE: SETTINGS (ADMIN) ==================== -->
+      <!-- ==================== PAGE: SETTINGS ==================== -->
       <div class="content hidden admin-page" id="page-settings">
-        <section class="hero-row"><div><p class="section-kicker">SYSTEM CONFIGURATION</p><h3>Admin Settings</h3><p class="section-description">Administrator-only thresholds, notifications, and cloud connection settings.</p></div></section>
+        <section class="hero-row"><div><p class="section-kicker">SYSTEM CONFIGURATION</p><h3>Admin Settings</h3><p class="section-description">Administrator-only notifications, cloud connection, and CHI reference.</p></div></section>
         <section class="settings-grid">
-          <article class="panel">
-            <div class="panel-header"><div><span class="section-kicker">HEALTH INDEX</span><h4>CHI Thresholds</h4></div></div>
-            <div class="threshold-list">
-              <label>Safe <input value="80" type="number" /></label>
-              <label>Moderate <input value="60" type="number" /></label>
-              <label>Poor <input value="40" type="number" /></label>
-              <label>Critical <input value="0" type="number" /></label>
-            </div>
-            <button class="primary-button">Save Configuration</button>
-          </article>
           <article class="panel">
             <div class="panel-header"><div><span class="section-kicker">NOTIFICATIONS</span><h4>Alert Preferences</h4></div></div>
             <div class="toggle-list">
@@ -350,6 +350,22 @@
               <span>Notifications</span><strong id="fbNotifyStatus">Ready for connection</strong>
             </div>
           </article>
+          <article class="panel">
+            <div class="panel-header"><div><span class="section-kicker">CLASSROOM HEALTH INDEX</span><h4>CHI Reference</h4></div></div>
+            <p style="margin:0 0 12px;color:#555;font-size:11px;line-height:1.6;">
+              CHI is calculated automatically from four metrics. It is not configurable.
+            </p>
+            <div class="chi-scale-bar" style="margin-bottom:0;">
+              <div class="chi-scale-zone critical">CRITICAL<small>0 – 39</small></div>
+              <div class="chi-scale-zone poor">POOR<small>40 – 59</small></div>
+              <div class="chi-scale-zone moderate">MODERATE<small>60 – 79</small></div>
+              <div class="chi-scale-zone safe">SAFE<small>80 – 100</small></div>
+            </div>
+            <p style="margin:12px 0 0;color:#777;font-size:10px;line-height:1.6;">
+              Safe = 100 pts · Moderate = 70 pts · Poor = 40 pts · Critical = 10 pts.
+              Metrics with no reading are skipped.
+            </p>
+          </article>
         </section>
       </div>
 
@@ -359,7 +375,6 @@
     </main>
   </div>
 
-  <!-- ==================== ADMIN LOGIN MODAL ==================== -->
   <div class="modal-backdrop hidden" id="loginModal" role="dialog" aria-modal="true" aria-labelledby="loginModalTitle">
     <div class="classroom-modal login-modal">
       <div class="modal-header">
@@ -379,17 +394,15 @@
     </div>
   </div>
 
-  <!-- ==================== TOAST ==================== -->
   <div class="toast" id="toast">
     <span>✓</span>
     <div><strong id="toastTitle">Updated</strong><small id="toastMessage">Action completed.</small></div>
   </div>
 
-<!-- ==================== FIREBASE SDK (compat build) ==================== -->
   <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
   <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-database-compat.js"></script>
   <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js"></script>
 
-  <script src="app.js"></script>
+  <script src="app.js?v=16"></script>
 </body>
 </html>
