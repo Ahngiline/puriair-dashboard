@@ -1,40 +1,18 @@
 /*
-  PURIAIR FRONTEND v12 — Firebase Realtime Database integration
-                              + Admin Manual Control
-                              + CROSS-DEVICE CLASSROOM ASSIGNMENTS
+  PURIAIR FRONTEND v16 — CHI Tile
   -------------------------------------------------------------------
   Schema read from Firebase:
     devices/<device_id>/latest/<field>
-    devices/<device_id>/control/<field>    (read + write by admin)
-    devices/<device_id>/status/<field>     (read-only, from ESP32)
-    assignments/<classroom_id>/<field>     (read + write, shared across PCs)
+    devices/<device_id>/control/<field>
+    devices/<device_id>/status/<field>
+    devices/<device_id>/readings/<YYYY-MM-DD>/<HH-MM-SS>
+    assignments/<classroom_id>/<field>
 
-  Field names (from ESP32 firmware):
-    latest:  clock_synced, co2_ppm, date, deviceId, device_uptime_ms,
-             humidity_pct, motion, pm25_ug_m3, temperature_C, time,
-             timestamp_ms, timezone
-    control: mode, power, purifierFan, humidifier, dehumidifier
-    status:  mode, power, purifierFan, humidifier, dehumidifier
-
-  assignments field names:
-    deviceId, deviceName, lastSynced, updatedAt
-
-  -------------------------------------------------------------------
-  Public view opens as Student (read-only) by default.
-  Admin logs in via modal: Username "Admin", Password "123admin".
-  Firebase URL: https://puriair-databasse-default-rtdb.firebaseio.com/
-  If Firebase is unreachable, the app falls back to a local demo simulation.
-
-  v12 CHANGES
-  - Classroom assignments now live in Firebase under /assignments so
-    that ANY PC that opens the site sees the same classroom list.
-  - localStorage is kept only as a fast first-paint cache and offline
-    fallback; Firebase is now the source of truth.
-  - Added attachAssignmentListener() so changes on one PC immediately
-    propagate to other open PCs in real time.
-  - saveAssignments() now writes to both localStorage and Firebase.
-  - Pending-write guard added so rapid toggles don't get clobbered
-    by Firebase snapshots echoing back.
+  v16 CHANGES
+  - CHI now appears as its own clickable telemetry tile alongside the
+    four raw metrics. Clicking it focuses the meter on CHI and shows
+    its condition band.
+  - Telemetry grid widened from 5 to 6 columns on desktop.
 */
 
 /* =========================================================
@@ -75,35 +53,46 @@ const PAGE_TITLES = {
 
 const ADMIN_ONLY_PAGES = ['settings', 'sensors', 'purifier', 'database'];
 
+/* CHI thresholds — match the official PuriAir table exactly */
+const CHI_THRESHOLDS = {
+  co2:         { safe: 700,  moderate: 1000, poor: 1500 },
+  pm25:        { safe: 12,   moderate: 35,   poor: 55   },
+  temperature: { safeMin: 20,   safeMax: 24,
+                 modMin: 24.1,  modMax: 27,
+                 poorMin: 27.1, poorMax: 30 },
+  humidity:    { safeMin: 30,   safeMax: 50,
+                 modMin: 51,    modMax: 60,
+                 poorMin: 61,   poorMax: 70 }
+};
+
+/* Points contributed per metric condition */
+const CONDITION_POINTS = {
+  safe: 100,
+  moderate: 70,
+  poor: 40,
+  critical: 10
+};
+
 /* =========================================================
    2. STATE
    ========================================================= */
 let classrooms     = [];
 let selectedRoom   = '';
 let selectedMetric = 'humidity';
-let esp32Temperature = 43.6;
 let currentRole    = 'student';
 let lastFirebaseSnapshot = 0;
 let rawFirebaseDevices = {};
 
 let serverTimeOffset = 0;
 
-/* ─── CHANGED ───
-   Local in-memory cache of assignments. Kept in sync with Firebase
-   by attachAssignmentListener(). loadAssignments() reads from this
-   first so the UI can render immediately on the first paint before
-   Firebase responds. */
 let assignmentsCache = {};
 let assignmentListenerAttached = false;
 let classroomListenerAttached  = false;
+let assignmentsLoadedFromFirebase = false;
 
-/* ─── CHANGED ───
-   Pending-write guard: prevents Firebase snapshots from clobbering
-   toggles the admin just flipped (race condition fix). */
 const pendingWrites = {};
 const PENDING_WRITE_GRACE_MS = 3000;
 
-/* Local mirror of the last control state we wrote to Firebase. */
 let purifierControlState = {
   mode: 'auto',
   power: false,
@@ -119,22 +108,24 @@ const $  = s => document.querySelector(s);
 const $$ = s => [...document.querySelectorAll(s)];
 const room    = () => classrooms.find(r => r.id === selectedRoom) || classrooms[0] || null;
 const isAdmin = () => currentRole === 'admin';
-const statusLabel = s => (s || '').toUpperCase();
+const statusLabel = s => (s || 'unknown').toUpperCase();
 const currentPage = () => $('.nav-item.active')?.dataset.page || 'puriair';
 
 function now() {
   return Date.now() + serverTimeOffset;
 }
 
-function num(v, fallback = 0) {
+function numOrNull(v) {
+  if (v === null || v === undefined || v === '') return null;
   const n = Number(v);
-  return Number.isFinite(n) ? n : fallback;
+  return Number.isFinite(n) ? n : null;
 }
-function valueClass(type, value) {
-  if (type === 'co2')  return value > 1500 ? 'value-danger' : value > 1000 ? 'value-warn' : 'value-good';
-  if (type === 'pm25') return value > 35   ? 'value-danger' : value > 15   ? 'value-warn' : 'value-good';
-  return '';
+
+function fmtOr(value, fn) {
+  if (value === null || value === undefined) return 'No reading';
+  return fn ? fn(value) : value;
 }
+
 function fmtDateTime(ms) {
   if (!ms) return '—';
   const d = new Date(ms);
@@ -145,41 +136,23 @@ function fmtDateTime(ms) {
 }
 
 /* =========================================================
-   4. DEVICE ASSIGNMENT PERSISTENCE  ─── CHANGED (Firebase-backed) ───
-   =========================================================
-
-   Assignments live in Firebase under /assignments/<classroomId>:
-     {
-       deviceId:   "puriair-01",
-       deviceName: "Classroom 311",
-       lastSynced: 1730000000000,
-       updatedAt:  1730000000000
-     }
-
-   localStorage is used only as a first-paint cache and as an offline
-   fallback when Firebase is unreachable.
+   4. ASSIGNMENT PERSISTENCE (Firebase-backed)
    ========================================================= */
-
 function loadAssignments() {
-  /* Prefer the live cache (populated by the Firebase listener) so
-     other PCs see the same assignments. Fall back to localStorage
-     only if the cache is empty (before the first snapshot arrives). */
   if (Object.keys(assignmentsCache).length) return assignmentsCache;
   try { return JSON.parse(localStorage.getItem(ASSIGNMENTS_KEY) || '{}'); }
   catch { return {}; }
 }
 
 function saveAssignments(data) {
-  /* Keep the in-memory cache authoritative for immediate re-reads. */
   assignmentsCache = data;
-
-  /* Write to localStorage for fast first-paint / offline fallback. */
   try { localStorage.setItem(ASSIGNMENTS_KEY, JSON.stringify(data)); } catch {}
 
-  /* ─── CHANGED ───
-     Push the whole assignments node to Firebase. We use set() on the
-     root /assignments node so deletions (removed classrooms) also
-     propagate across PCs. */
+  if (!assignmentsLoadedFromFirebase) {
+    console.warn('[PuriAir] saveAssignments blocked — Firebase snapshot not yet received.');
+    return;
+  }
+
   if (firebaseReady && db) {
     db.ref('assignments').set(data).catch(err => {
       console.error('[PuriAir] assignment save failed:', err);
@@ -188,9 +161,6 @@ function saveAssignments(data) {
   }
 }
 
-/* ─── CHANGED ───
-   Live listener: any change to /assignments on any PC is reflected
-   here within milliseconds. */
 function attachAssignmentListener() {
   if (!firebaseReady || !db || assignmentListenerAttached) return;
   assignmentListenerAttached = true;
@@ -198,6 +168,7 @@ function attachAssignmentListener() {
   db.ref('assignments').on('value', snap => {
     const val = snap.val() || {};
     assignmentsCache = val;
+    assignmentsLoadedFromFirebase = true;
     try { localStorage.setItem(ASSIGNMENTS_KEY, JSON.stringify(val)); } catch {}
     buildClassroomsFromAssignments();
     renderAllViews();
@@ -218,7 +189,7 @@ function availableDeviceIds() {
 }
 
 /* =========================================================
-   5. FIREBASE INIT (with Anonymous Auth)
+   5. FIREBASE INIT
    ========================================================= */
 function initFirebase() {
   try {
@@ -231,15 +202,11 @@ function initFirebase() {
     db = firebase.database();
     firebaseReady = true;
 
-    /* ---- Anonymous authentication ---- */
     if (firebase.auth) {
       firebase.auth().onAuthStateChanged(user => {
         if (user) {
           console.log('[PuriAir] Firebase auth ready. UID:', user.uid);
           firebaseAuthReady = true;
-          /* ─── CHANGED ───
-             Attach listeners only after auth succeeds so the first
-             read doesn't get permission_denied if rules require auth. */
           attachFirebaseListeners();
           attachAssignmentListener();
         } else {
@@ -251,7 +218,6 @@ function initFirebase() {
       });
     } else {
       console.warn('[PuriAir] firebase-auth-compat.js not loaded. Admin writes may fail.');
-      /* No auth SDK → attach listeners anyway so the app still works. */
       attachFirebaseListeners();
       attachAssignmentListener();
     }
@@ -285,11 +251,8 @@ function setFirebaseUiStatus(state, label) {
   const c = COLOR[state] || COLOR.offline;
 
   const pillLabels = {
-    offline: 'Offline',
-    connecting: 'Connecting',
-    idle: 'Idle',
-    stale: 'No recent data',
-    live: 'Live'
+    offline: 'Offline', connecting: 'Connecting',
+    idle: 'Idle', stale: 'No recent data', live: 'Live'
   };
 
   if (dot) dot.style.background = c.dot;
@@ -308,65 +271,189 @@ function setFirebaseUiStatus(state, label) {
 /* =========================================================
    6. FIREBASE → CLASSROOMS SYNC
    ========================================================= */
+function conditionCO2(v) {
+  if (v === null) return 'unknown';
+  if (v < CHI_THRESHOLDS.co2.safe)      return 'safe';
+  if (v <= CHI_THRESHOLDS.co2.moderate) return 'moderate';
+  if (v <= CHI_THRESHOLDS.co2.poor)     return 'poor';
+  return 'critical';
+}
+function conditionPM25(v) {
+  if (v === null) return 'unknown';
+  if (v < CHI_THRESHOLDS.pm25.safe)      return 'safe';
+  if (v <= CHI_THRESHOLDS.pm25.moderate) return 'moderate';
+  if (v <= CHI_THRESHOLDS.pm25.poor)     return 'poor';
+  return 'critical';
+}
+function conditionTemperature(v) {
+  if (v === null) return 'unknown';
+  if (v >= CHI_THRESHOLDS.temperature.safeMin && v <= CHI_THRESHOLDS.temperature.safeMax) return 'safe';
+  if (v >= CHI_THRESHOLDS.temperature.modMin  && v <= CHI_THRESHOLDS.temperature.modMax)  return 'moderate';
+  if (v >= CHI_THRESHOLDS.temperature.poorMin && v <= CHI_THRESHOLDS.temperature.poorMax) return 'poor';
+  return 'critical';
+}
+function conditionHumidity(v) {
+  if (v === null) return 'unknown';
+  if (v >= CHI_THRESHOLDS.humidity.safeMin && v <= CHI_THRESHOLDS.humidity.safeMax) return 'safe';
+  if (v >= CHI_THRESHOLDS.humidity.modMin  && v <= CHI_THRESHOLDS.humidity.modMax)  return 'moderate';
+  if (v >= CHI_THRESHOLDS.humidity.poorMin && v <= CHI_THRESHOLDS.humidity.poorMax) return 'poor';
+  return 'critical';
+}
+
+/* CHI is a composite score 0–100. Higher is better.
+   80–100 safe, 60–79 moderate, 40–59 poor, 0–39 critical. */
+function conditionCHI(v) {
+  if (v === null) return 'unknown';
+  if (v >= 80) return 'safe';
+  if (v >= 60) return 'moderate';
+  if (v >= 40) return 'poor';
+  return 'critical';
+}
+
+function roomStatusFromConditions(conds) {
+  if (conds.every(c => c === 'unknown')) return 'unknown';
+  if (conds.includes('critical')) return 'critical';
+  if (conds.includes('poor'))     return 'poor';
+  if (conds.includes('moderate')) return 'moderate';
+  return 'safe';
+}
+
+/* Zone-aligned meter position. */
+function metricScore(type, value) {
+  if (value === null) return null;
+
+  const zone = metricCondition(type, value);
+
+  const ZONES = {
+    critical: { start: 0,  end: 25 },
+    poor:     { start: 25, end: 50 },
+    moderate: { start: 50, end: 75 },
+    safe:     { start: 75, end: 100 }
+  };
+
+  const z = ZONES[zone];
+  if (!z) return 50;
+
+  let t = 0.5;
+
+  if (type === 'co2') {
+    const T = CHI_THRESHOLDS.co2;
+    if (zone === 'safe')          t = Math.min(1, value / T.safe);
+    else if (zone === 'moderate') t = (value - T.safe)     / (T.moderate - T.safe);
+    else if (zone === 'poor')     t = (value - T.moderate) / (T.poor     - T.moderate);
+    else                          t = Math.min(1, (value - T.poor) / 500);
+  } else if (type === 'pm25') {
+    const T = CHI_THRESHOLDS.pm25;
+    if (zone === 'safe')          t = Math.min(1, value / T.safe);
+    else if (zone === 'moderate') t = (value - T.safe)     / (T.moderate - T.safe);
+    else if (zone === 'poor')     t = (value - T.moderate) / (T.poor     - T.moderate);
+    else                          t = Math.min(1, (value - T.poor) / 45);
+  } else if (type === 'temperature') {
+    const T = CHI_THRESHOLDS.temperature;
+    if (zone === 'safe')          t = 0.5 + (value - 22) / 4;
+    else if (zone === 'moderate') t = (value - T.modMin)  / (T.modMax  - T.modMin);
+    else if (zone === 'poor')     t = (value - T.poorMin) / (T.poorMax - T.poorMin);
+    else                          t = value < 20
+      ? Math.max(0, 1 - (18 - value) / 18)
+      : Math.min(1, (value - 30) / 20);
+  } else if (type === 'humidity') {
+    const T = CHI_THRESHOLDS.humidity;
+    if (zone === 'safe')          t = 0.5 + (value - 40) / 20;
+    else if (zone === 'moderate') t = (value - T.modMin)  / (T.modMax  - T.modMin);
+    else if (zone === 'poor')     t = (value - T.poorMin) / (T.poorMax - T.poorMin);
+    else                          t = value < 30
+      ? Math.max(0, 1 - (20 - value) / 20)
+      : Math.min(1, (value - 70) / 20);
+  } else if (type === 'chi') {
+    /* CHI uses the same 0–100 scale as the meter.
+       Bands: 0–39 critical, 40–59 poor, 60–79 moderate, 80–100 safe. */
+    if (zone === 'safe')          t = (value - 80) / 20;
+    else if (zone === 'moderate') t = (value - 60) / 20;
+    else if (zone === 'poor')     t = (value - 40) / 20;
+    else                          t = value / 40;
+  }
+
+  t = Math.max(0, Math.min(1, t));
+  return z.start + t * (z.end - z.start);
+}
+
+/* CHI = average of per-metric condition points. */
+function computeCHI(co2, pm25, temp, humidity) {
+  const conds = [
+    conditionCO2(co2),
+    conditionPM25(pm25),
+    conditionTemperature(temp),
+    conditionHumidity(humidity)
+  ].filter(c => c !== 'unknown');
+
+  if (!conds.length) return null;
+
+  const total = conds.reduce((a, c) => a + CONDITION_POINTS[c], 0);
+  return Math.round(total / conds.length);
+}
+
 function normalizeDeviceToRoom(devId, node, assignment, lastSyncedMs) {
-  const latest  = (node && node.latest) || {};
-  const control = (node && node.control) || {};
-  const status  = (node && node.status) || {};
-  const classroomId = assignment.classroomId || devId;
+  if (!node || typeof node !== 'object') return null;
+  const latest  = (node.latest  && typeof node.latest  === 'object') ? node.latest  : null;
+  const control = (node.control && typeof node.control === 'object') ? node.control : null;
+  const status  = (node.status  && typeof node.status  === 'object') ? node.status  : null;
 
-  const co2         = num(latest.co2_ppm, 0);
-  const pm25        = num(latest.pm25_ug_m3, 0);
-  const temperature = num(latest.temperature_C, 0);
-  const humidity    = num(latest.humidity_pct, 0);
-  const motion      = latest.motion === true;
-  const occupancy   = motion ? 1 : 0;
+  const co2         = numOrNull(latest?.co2_ppm);
+  const pm25        = numOrNull(latest?.pm25_ug_m3);
+  const temperature = numOrNull(latest?.temperature_C);
+  const humidity    = numOrNull(latest?.humidity_pct);
+  const motionRaw   = latest?.motion;
+  const occupancy   = motionRaw === true ? 1 : (motionRaw === false ? 0 : null);
+  const purifier    = latest?.purifier === true;
 
-  const purifier = latest.purifier === true || (co2 > 1000 || pm25 > 20);
+  const conds = [
+    conditionCO2(co2),
+    conditionPM25(pm25),
+    conditionTemperature(temperature),
+    conditionHumidity(humidity)
+  ];
+  const statusText = roomStatusFromConditions(conds);
+  const chi = computeCHI(co2, pm25, temperature, humidity);
 
-  const penalty =
-    Math.max(0, (co2 - 500) / 35) +
-    Math.max(0, (pm25 - 8) * 1.2) +
-    Math.max(0, (humidity - 65) * 0.7);
-  const chi = Math.max(20, Math.min(98, Math.round(96 - penalty - occupancy * 0.05)));
-
-  const statusText =
-    co2 > 1700 || pm25 > 35 ? 'critical' :
-    co2 > 1250 || pm25 > 25 ? 'poor' :
-    co2 > 950  || pm25 > 15 ? 'moderate' :
-    'safe';
-
-  const tsMs = num(latest.timestamp_ms, 0);
+  const tsMs = numOrNull(latest?.timestamp_ms) ?? 0;
   const hasTimestamp = tsMs > 0;
-  const ageMs = hasTimestamp ? (now() - tsMs) : Infinity;
-  const fresh = hasTimestamp && ageMs < DEVICE_FRESH_MS;
-  const online = latest.clock_synced === true && fresh;
+  const ageMs = hasTimestamp ? (now() - tsMs) : null;
+  const fresh = hasTimestamp && ageMs !== null && ageMs < DEVICE_FRESH_MS;
+  const online = latest?.clock_synced === true && fresh;
 
   let lastSynced = lastSyncedMs || 0;
-  if (hasTimestamp && tsMs > lastSynced && fresh) lastSynced = tsMs;
+  if (hasTimestamp && fresh && tsMs > lastSynced) lastSynced = tsMs;
 
   return {
-    id: classroomId,
-    name: assignment.deviceName || `Classroom ${classroomId}`,
+    id: assignment.classroomId || devId,
+    name: assignment.deviceName || `Classroom ${assignment.classroomId || devId}`,
     deviceId: devId,
-    chi, co2, pm25, temperature, humidity, occupancy, purifier,
+    chi,
+    co2, pm25, temperature, humidity,
+    occupancy,
+    purifier,
     status: statusText,
+    conditions: {
+      co2: conds[0], pm25: conds[1],
+      temperature: conds[2], humidity: conds[3]
+    },
     lastSynced,
+    hasAnyReading: !(co2 === null && pm25 === null && temperature === null && humidity === null),
     device: {
-      esp32_temperature: num(latest.temperature_C, 0),
       online,
       hasTimestamp,
-      ageMs: hasTimestamp ? ageMs : null,
+      ageMs,
       last_seen: tsMs || 0,
-      device_id: latest.deviceId || devId,
-      uptime_ms: num(latest.device_uptime_ms, 0),
+      device_id: latest?.deviceId || devId,
+      uptime_ms: numOrNull(latest?.device_uptime_ms) ?? 0,
       raw: { latest, control, status }
     },
     control: {
-      mode: control.mode || 'auto',
-      power: control.power === true,
-      purifierFan: control.purifierFan === true,
-      humidifier: control.humidifier === true,
-      dehumidifier: control.dehumidifier === true
+      mode: control?.mode || null,
+      power: control?.power === true,
+      purifierFan: control?.purifierFan === true,
+      humidifier: control?.humidifier === true,
+      dehumidifier: control?.dehumidifier === true
     }
   };
 }
@@ -374,12 +461,23 @@ function normalizeDeviceToRoom(devId, node, assignment, lastSyncedMs) {
 function buildClassroomsFromAssignments() {
   const assignments = loadAssignments();
   const built = [];
-  let dirty = false;   /* ─── CHANGED ─── avoid needless re-saves */
+  let dirty = false;
 
   Object.entries(assignments).forEach(([classroomId, a]) => {
     const devId = a.deviceId;
-    const node  = rawFirebaseDevices[devId] || { latest: {}, control: {}, status: {} };
-    const r = normalizeDeviceToRoom(devId, node, { ...a, classroomId, deviceName: a.deviceName || `Classroom ${classroomId}` }, a.lastSynced);
+    if (!devId) return;
+
+    const node = rawFirebaseDevices[devId];
+    if (!node || typeof node !== 'object') return;
+
+    const r = normalizeDeviceToRoom(
+      devId,
+      node,
+      { ...a, classroomId, deviceName: a.deviceName || `Classroom ${classroomId}` },
+      a.lastSynced
+    );
+    if (!r) return;
+
     built.push(r);
 
     if (r.device.online && r.lastSynced > (a.lastSynced || 0)) {
@@ -388,7 +486,6 @@ function buildClassroomsFromAssignments() {
     }
   });
 
-  /* ─── CHANGED ─── only persist if something actually changed */
   if (dirty) saveAssignments(assignments);
 
   classrooms = built;
@@ -401,16 +498,12 @@ function buildClassroomsFromAssignments() {
 
 function computeGlobalStatus() {
   if (!firebaseReady) return 'offline';
-
-  /* ─── CHANGED ───
-     Look at raw device freshness instead of only assigned classrooms,
-     so unassigned-but-live devices don't show "stale". */
   const ids = Object.keys(rawFirebaseDevices);
   if (!ids.length) return 'idle';
 
   const anyFresh = Object.values(rawFirebaseDevices).some(node => {
-    const ts = num(node?.latest?.timestamp_ms, 0);
-    return ts > 0 && (now() - ts) < DEVICE_FRESH_MS;
+    const ts = numOrNull(node?.latest?.timestamp_ms);
+    return ts !== null && ts > 0 && (now() - ts) < DEVICE_FRESH_MS;
   });
 
   return anyFresh ? 'live' : 'stale';
@@ -442,7 +535,7 @@ function renderFreshnessBanner() {
 
   let newest = 0;
   Object.values(rawFirebaseDevices).forEach(node => {
-    const ts = num(node?.latest?.timestamp_ms, 0);
+    const ts = numOrNull(node?.latest?.timestamp_ms) ?? 0;
     if (ts > newest) newest = ts;
   });
 
@@ -460,7 +553,7 @@ function attachFirebaseListeners() {
   classroomListenerAttached = true;
 
   db.ref('.info/serverTimeOffset').on('value', snap => {
-    serverTimeOffset = num(snap.val(), 0);
+    serverTimeOffset = numOrNull(snap.val()) ?? 0;
     buildClassroomsFromAssignments();
     renderAllViews();
   });
@@ -485,17 +578,16 @@ function attachFirebaseListeners() {
 
     const state = computeGlobalStatus();
     const labelMap = {
-      idle: 'Connected · Idle',
-      stale: 'No recent data',
-      live: 'Firebase live',
-      offline: 'Disconnected'
+      idle: 'Connected · Idle', stale: 'No recent data',
+      live: 'Firebase live',    offline: 'Disconnected'
     };
     setFirebaseUiStatus(state, labelMap[state]);
     renderAllViews();
     renderFreshnessBanner();
 
     const ls = $('#lastSync');
-    if (ls) ls.textContent = state === 'live' ? 'just now' : (rawFirebaseDevices && Object.keys(rawFirebaseDevices).length ? 'no recent data' : 'waiting for devices');
+    if (ls) ls.textContent = state === 'live' ? 'just now'
+      : (rawFirebaseDevices && Object.keys(rawFirebaseDevices).length ? 'no recent data' : 'waiting for devices');
   }, err => {
     console.error('[PuriAir] Firebase read error:', err);
     setFirebaseUiStatus('offline', 'Read error');
@@ -563,23 +655,24 @@ function handleLoginButton() {
    8. METRIC HELPERS
    ========================================================= */
 function metricCondition(type, value) {
-  const v = Number(value);
-  if (type === 'humidity')    return v >= 40 && v <= 60 ? 'safe' : (v >= 30 && v <= 70 ? 'moderate' : (v >= 20 && v <= 80 ? 'poor' : 'critical'));
-  if (type === 'co2')         return v <= 800 ? 'safe' : (v <= 1000 ? 'moderate' : (v <= 1500 ? 'poor' : 'critical'));
-  if (type === 'pm25')        return v <= 15  ? 'safe' : (v <= 25   ? 'moderate' : (v <= 35   ? 'poor' : 'critical'));
-  if (type === 'temperature') return v >= 23 && v <= 27 ? 'safe' : ((v >= 21 && v < 23) || (v > 27 && v <= 29) ? 'moderate' : ((v >= 18 && v < 21) || (v > 29 && v <= 32) ? 'poor' : 'critical'));
-  return 'safe';
+  if (type === 'humidity')    return conditionHumidity(value);
+  if (type === 'co2')         return conditionCO2(value);
+  if (type === 'pm25')        return conditionPM25(value);
+  if (type === 'temperature') return conditionTemperature(value);
+  if (type === 'chi')         return conditionCHI(value);
+  return 'unknown';
 }
 function metricLabel(type) {
-  return ({ humidity:'HUMIDITY', co2:'CO₂', pm25:'PM2.5', temperature:'TEMPERATURE' })[type] || 'METRIC';
+  return ({
+    humidity:'HUMIDITY', co2:'CO₂', pm25:'PM2.5',
+    temperature:'TEMPERATURE', chi:'CHI'
+  })[type] || 'METRIC';
 }
-function metricScore(type, value) {
-  const v = Number(value);
-  if (type === 'co2')         return Math.max(0, Math.min(100, 100 - ((v - 400) / (2000 - 400)) * 100));
-  if (type === 'pm25')        return Math.max(0, Math.min(100, 100 - (v / 55) * 100));
-  if (type === 'humidity')    return Math.max(0, Math.min(100, 100 - Math.abs(v - 50) * 2.5));
-  if (type === 'temperature') return Math.max(0, Math.min(100, 100 - Math.abs(v - 25) * 12));
-  return 0;
+function metricUnit(type) {
+  return ({
+    humidity:'%', co2:'ppm', pm25:'µg/m³',
+    temperature:'°C', chi:'/ 100'
+  })[type] || '';
 }
 
 /* =========================================================
@@ -609,21 +702,25 @@ function renderOverview() {
 
   tbody.innerHTML = classrooms.map(r => {
     const offlineBadge = r.device.online ? '' : ' <span class="offline-inline" title="Device offline">●</span>';
+    const chiText = r.chi === null ? '--' : r.chi;
     return `
     <tr class="condition-row ${r.status}">
       <td><span class="room-name">${r.id}</span>${offlineBadge}<small>${r.name}</small></td>
-      <td><div class="chi-status-cell"><strong>${r.chi}</strong><span class="status-chip ${r.status}">${statusLabel(r.status)}</span></div></td>
-      <td class="${r.status}">${r.humidity}%</td>
-      <td class="${valueClass('co2',r.co2)} ${r.status}">${r.co2} ppm</td>
-      <td class="${valueClass('pm25',r.pm25)} ${r.status}">${r.pm25} µg/m³</td>
-      <td class="${r.status}">${Number(r.temperature).toFixed(1)} °C</td>
-      <td class="${r.status}">${r.purifier ? '<span class="value-good">ACTIVE</span>' : '<span>OFF</span>'}</td>
+      <td><div class="chi-status-cell"><strong>${chiText}</strong><span class="status-chip ${r.status}">${statusLabel(r.status)}</span></div></td>
+      <td class="${r.status}">${fmtOr(r.humidity, v => v + '%')}</td>
+      <td class="${r.status}">${fmtOr(r.co2, v => v + ' ppm')}</td>
+      <td class="${r.status}">${fmtOr(r.pm25, v => v + ' µg/m³')}</td>
+      <td class="${r.status}">${fmtOr(r.temperature, v => Number(v).toFixed(1) + ' °C')}</td>
+      <td class="${r.status}">${r.purifier ? '<span class="value-good">ACTIVE</span>' : '<span>—</span>'}</td>
     </tr>`;
   }).join('');
 
   const safe     = classrooms.filter(r => r.status === 'safe').length;
-  const occupied = classrooms.filter(r => r.occupancy > 0).length;
-  const overall  = Math.round(classrooms.reduce((a, r) => a + r.chi, 0) / classrooms.length);
+  const occupied = classrooms.filter(r => r.occupancy === 1).length;
+  const withCHI  = classrooms.filter(r => r.chi !== null);
+  const overall  = withCHI.length
+    ? Math.round(withCHI.reduce((a, r) => a + r.chi, 0) / withCHI.length)
+    : null;
 
   const set = (sel, val) => { const el = $(sel); if (el) el.textContent = val; };
   set('#classroomCount', classrooms.length);
@@ -634,12 +731,16 @@ function renderOverview() {
   set('#legendModerate', classrooms.filter(r => r.status === 'moderate').length);
   set('#legendPoor', classrooms.filter(r => r.status === 'poor').length);
   set('#legendCritical', classrooms.filter(r => r.status === 'critical').length);
-  set('#overallCHI', overall);
+  set('#overallCHI', overall === null ? '--' : overall);
 
   const gauge = $('#chiGauge');
   if (gauge) {
-    const gaugeColor = overall >= 80 ? 'safe' : overall >= 60 ? 'moderate' : overall >= 40 ? 'poor' : 'critical';
-    gauge.style.background = `conic-gradient(var(--${gaugeColor}) 0deg ${overall * 3.6}deg,#eee ${overall * 3.6}deg 360deg)`;
+    if (overall === null) {
+      gauge.style.background = 'conic-gradient(#eee 0deg 360deg)';
+    } else {
+      const gaugeColor = overall >= 80 ? 'safe' : overall >= 60 ? 'moderate' : overall >= 40 ? 'poor' : 'critical';
+      gauge.style.background = `conic-gradient(var(--${gaugeColor}) 0deg ${overall * 3.6}deg,#eee ${overall * 3.6}deg 360deg)`;
+    }
   }
 }
 
@@ -649,7 +750,7 @@ function renderClassrooms() {
 
   if (!classrooms.length) {
     if (roomSel) roomSel.innerHTML = '<option>No classrooms assigned</option>';
-    if (cards)   cards.innerHTML = '<div class="panel" style="padding:20px;color:#999;text-align:center">No PuriAir devices have been paired with a classroom yet. An administrator must assign a device in the Classroom Management panel.</div>';
+    if (cards)   cards.innerHTML = '<div class="panel" style="padding:20px;color:#999;text-align:center">No PuriAir devices have been paired with a classroom yet, or assigned devices have never published to Firebase.</div>';
     return;
   }
 
@@ -663,18 +764,19 @@ function renderClassrooms() {
     cards.innerHTML = classrooms.map(r => {
       const ageTxt = r.device.online
         ? 'just now'
-        : (r.device.hasTimestamp ? `${Math.round(r.device.ageMs / 1000)}s ago` : 'no timestamp');
+        : (r.device.hasTimestamp ? `${Math.round(r.device.ageMs / 1000)}s ago` : 'never');
+      const chiText = r.chi === null ? '--' : `CHI ${r.chi}`;
       return `
       <article class="room-card condition-box ${r.status} ${r.id === selectedRoom ? 'selected' : ''} ${r.device.online ? '' : 'device-offline'}" data-room="${r.id}">
         <div class="room-card-head">
           <h5>${r.id}</h5>
-          <div class="card-status"><strong>CHI ${r.chi}</strong><span class="status-chip ${r.status}">${statusLabel(r.status)}</span></div>
+          <div class="card-status"><strong>${chiText}</strong><span class="status-chip ${r.status}">${statusLabel(r.status)}</span></div>
         </div>
         <div class="room-mini">
-          <div><span>Humidity</span><strong>${r.humidity}%</strong></div>
-          <div><span>CO₂</span><strong>${r.co2} ppm</strong></div>
-          <div><span>PM2.5</span><strong>${r.pm25} µg/m³</strong></div>
-          <div><span>Temperature</span><strong>${Number(r.temperature).toFixed(1)} °C</strong></div>
+          <div><span>Humidity</span><strong>${fmtOr(r.humidity, v => v + '%')}</strong></div>
+          <div><span>CO₂</span><strong>${fmtOr(r.co2, v => v + ' ppm')}</strong></div>
+          <div><span>PM2.5</span><strong>${fmtOr(r.pm25, v => v + ' µg/m³')}</strong></div>
+          <div><span>Temperature</span><strong>${fmtOr(r.temperature, v => Number(v).toFixed(1) + ' °C')}</strong></div>
         </div>
         <div class="room-card-foot">
           <span class="room-device-tag ${r.device.online ? 'online' : 'offline'}">
@@ -716,38 +818,53 @@ function renderRoomDetail() {
     $('#detailStatus').className = `status-chip ${r.status}`;
     $('#detailStatus').textContent = statusLabel(r.status);
   }
-  if ($('#detailCHI')) $('#detailCHI').textContent = r.chi;
+  if ($('#detailCHI')) $('#detailCHI').textContent = r.chi === null ? '--' : r.chi;
 
   const telemetry = [
     ['humidity',    'Humidity',    r.humidity,                       '%'],
     ['co2',         'CO₂',         r.co2,                            'ppm'],
     ['pm25',        'PM2.5',       r.pm25,                           'µg/m³'],
-    ['temperature', 'Temperature', Number(r.temperature).toFixed(1), '°C']
+    ['temperature', 'Temperature', r.temperature,                    '°C']
   ];
 
   const metricTiles = telemetry.map(x => {
-    const status = metricCondition(x[0], x[2]);
+    const status = x[2] === null ? 'unknown' : metricCondition(x[0], x[2]);
+    const display = x[2] === null ? 'No reading'
+      : (x[0] === 'temperature' ? Number(x[2]).toFixed(1) : x[2]);
     return `<button type="button"
               class="telemetry metric-telemetry condition-box ${status} ${selectedMetric === x[0] ? 'active-metric' : ''}"
               data-metric="${x[0]}"
               aria-label="View ${x[1]} condition">
       <span>${x[1]}</span>
-      <strong>${x[2]}</strong>
+      <strong>${display}</strong>
       <em>${x[3]}</em>
       <small class="metric-condition-label">${statusLabel(status)}</small>
     </button>`;
   }).join('');
 
+  /* CHI tile — treated as a composite metric alongside the four raw ones. */
+  const chiStatus  = r.chi === null ? 'unknown' : conditionCHI(r.chi);
+  const chiDisplay = r.chi === null ? 'No reading' : r.chi;
+  const chiTile = `<button type="button"
+              class="telemetry metric-telemetry condition-box ${chiStatus} ${selectedMetric === 'chi' ? 'active-metric' : ''}"
+              data-metric="chi"
+              aria-label="View CHI condition">
+      <span>CHI</span>
+      <strong>${chiDisplay}</strong>
+      <em>/ 100</em>
+      <small class="metric-condition-label">${statusLabel(chiStatus)}</small>
+    </button>`;
+
   const occupancyTile = `
-    <div class="telemetry occupancy-tile ${r.occupancy > 0 ? 'occupied' : 'vacant'}">
+    <div class="telemetry occupancy-tile ${r.occupancy === 1 ? 'occupied' : 'vacant'}">
       <span>Occupancy</span>
-      <strong>${r.occupancy > 0 ? 'OCCUPIED' : 'VACANT'}</strong>
-      <em>${r.occupancy > 0 ? 'Motion detected' : 'No occupants detected'}</em>
+      <strong>${r.occupancy === null ? 'No reading' : (r.occupancy === 1 ? 'OCCUPIED' : 'VACANT')}</strong>
+      <em>${r.occupancy === 1 ? 'Motion detected' : (r.occupancy === 0 ? 'No occupants detected' : 'No PIR data received')}</em>
     </div>`;
 
   const grid = $('#detailTelemetry');
   if (grid) {
-    grid.innerHTML = metricTiles + occupancyTile;
+    grid.innerHTML = metricTiles + chiTile + occupancyTile;
     $$('#detailTelemetry .metric-telemetry').forEach(el =>
       el.addEventListener('click', () => {
         selectedMetric = el.dataset.metric;
@@ -756,7 +873,10 @@ function renderRoomDetail() {
     );
   }
 
-  const selected = telemetry.find(x => x[0] === selectedMetric) || telemetry[0];
+  let selected = telemetry.find(x => x[0] === selectedMetric) || telemetry[0];
+  if (selectedMetric === 'chi') {
+    selected = ['chi', 'CHI', r.chi, '/ 100'];
+  }
   renderMetricCondition(selected[0], selected[2]);
 
   if ($('#fanStatus')) $('#fanStatus').textContent = r.purifier ? 'ACTIVE' : 'INACTIVE';
@@ -775,15 +895,25 @@ function renderRoomDetail() {
 }
 
 function renderMetricCondition(type, value) {
-  const status = metricCondition(type, value);
-  const score  = Math.round(metricScore(type, value));
+  const status = value === null ? 'unknown' : metricCondition(type, value);
+  const score  = metricScore(type, value);
 
-  if ($('#conditionMeterValue')) $('#conditionMeterValue').textContent = `${value} · ${statusLabel(status)}`;
+  const valueText = value === null
+    ? 'No reading'
+    : `${type === 'temperature' ? Number(value).toFixed(1) : value} ${metricUnit(type)} · ${statusLabel(status)}`;
+
+  if ($('#conditionMeterValue')) $('#conditionMeterValue').textContent = valueText;
   const arrow = $('#conditionMeterArrow');
   if (arrow) {
-    arrow.style.left = `${Math.max(2, Math.min(98, score))}%`;
-    arrow.className  = `condition-arrow ${status}`;
-    arrow.textContent = '▼';
+    if (score === null) {
+      arrow.style.left = '50%';
+      arrow.className  = 'condition-arrow unknown';
+      arrow.textContent = '—';
+    } else {
+      arrow.style.left = `${Math.max(2, Math.min(98, Math.round(score)))}%`;
+      arrow.className  = `condition-arrow ${status}`;
+      arrow.textContent = '▼';
+    }
   }
   if ($('#conditionMeterCaption')) $('#conditionMeterCaption').textContent = `${metricLabel(type)} CONDITION · ${statusLabel(status)}`;
   if ($('#conditionMeter')) $('#conditionMeter').className = `condition-meter ${status}`;
@@ -796,13 +926,144 @@ function renderMetricCondition(type, value) {
   }
 }
 
-function inputAvailable(value) {
-  return value !== null && value !== undefined && value !== '' && Number.isFinite(Number(value));
+/* =========================================================
+   CHI MODAL
+   ========================================================= */
+function renderChiModal() {
+  const body = $('#chiModalBody');
+  if (!body) return;
+
+  const r = room();
+  if (!r) {
+    body.innerHTML = '<p class="chi-explainer">No classroom is currently selected.</p>';
+    return;
+  }
+
+  const overall = r.chi;
+  const status = r.status;
+  const conds = r.conditions || {};
+  const statusLabelText = statusLabel(status);
+
+  let scoreClass = 'unknown';
+  if (overall !== null) {
+    scoreClass = overall >= 80 ? 'safe'
+               : overall >= 60 ? 'moderate'
+               : overall >= 40 ? 'poor'
+               : 'critical';
+  }
+
+  const rows = [
+    { name: 'CO₂',         value: r.co2,         unit: 'ppm',   cond: conds.co2 },
+    { name: 'PM2.5',       value: r.pm25,        unit: 'µg/m³', cond: conds.pm25 },
+    { name: 'Temperature', value: r.temperature, unit: '°C',    cond: conds.temperature },
+    { name: 'Humidity',    value: r.humidity,    unit: '%',     cond: conds.humidity }
+  ];
+
+  const rowsHtml = rows.map(row => {
+    const cond = row.cond || 'unknown';
+    const display = row.value === null || row.value === undefined
+      ? 'No reading'
+      : (row.name === 'Temperature' ? Number(row.value).toFixed(1) : row.value) + ' ' + row.unit;
+    const points = CONDITION_POINTS[cond];
+    const pointsText = points === undefined ? '—' : points;
+    return `
+      <tr>
+        <td><strong>${row.name}</strong></td>
+        <td>${display}</td>
+        <td class="condition-cell ${cond}">${statusLabel(cond)}</td>
+        <td><strong>${pointsText}</strong></td>
+      </tr>`;
+  }).join('');
+
+  body.innerHTML = `
+    <div class="chi-modal-section">
+      <div class="chi-modal-score">
+        <div class="chi-modal-score-num ${scoreClass}">
+          ${overall === null ? '--' : overall}
+        </div>
+        <div class="chi-modal-score-meta">
+          <strong>${statusLabelText}</strong>
+          <small>
+            ${overall === null
+              ? 'No metric has reported a reading yet.'
+              : `Average of the four individual metric conditions for ${r.id}.`}
+          </small>
+        </div>
+      </div>
+
+      <div class="chi-scale-bar">
+        <div class="chi-scale-zone critical">CRITICAL<small>0 – 39</small></div>
+        <div class="chi-scale-zone poor">POOR<small>40 – 59</small></div>
+        <div class="chi-scale-zone moderate">MODERATE<small>60 – 79</small></div>
+        <div class="chi-scale-zone safe">SAFE<small>80 – 100</small></div>
+      </div>
+    </div>
+
+    <div class="chi-modal-section">
+      <h5>This room's breakdown</h5>
+      <table class="chi-breakdown-table">
+        <thead>
+          <tr>
+            <th>Metric</th>
+            <th>Reading</th>
+            <th>Condition</th>
+            <th>Points</th>
+          </tr>
+        </thead>
+        <tbody>${rowsHtml}</tbody>
+      </table>
+    </div>
+
+    <div class="chi-modal-section">
+      <h5>How CHI is computed</h5>
+      <p class="chi-explainer">
+        Each metric is graded against the official PuriAir table:
+        <br><br>
+        <code>Safe = 100 pts · Moderate = 70 pts · Poor = 40 pts · Critical = 10 pts</code>
+        <br><br>
+        <strong>CHI = average of all reported metrics.</strong> Metrics with no reading are skipped.
+        If a metric is <code>UNKNOWN</code>, it does not contribute to CHI.
+        <br><br>
+        Example: one safe, one moderate, one poor → <code>(100 + 70 + 40) / 3 = 70 → MODERATE</code>.
+      </p>
+    </div>
+  `;
 }
-function sensorState(ok, goodLabel = 'Functioning', badLabel = 'Malfunctioning') {
-  return ok ? { label: goodLabel, tone: 'safe' } : { label: badLabel, tone: 'critical' };
+
+function openChiModal() {
+  renderChiModal();
+  $('#chiModal')?.classList.remove('hidden');
 }
-function formatDuration(ms){ const total=Math.max(0,Math.floor(ms/1000)); const d=Math.floor(total/86400), h=Math.floor((total%86400)/3600), m=Math.floor((total%3600)/60); return `${d}d ${h}h ${m}m`; }
+function closeChiModal() {
+  $('#chiModal')?.classList.add('hidden');
+}
+
+/* =========================================================
+   10. SENSOR STATUS PAGE
+   ========================================================= */
+function sensorStateFromValue(value) {
+  if (value === null) return 'unknown';
+  if (!Number.isFinite(Number(value))) return 'malfunctioning';
+  return 'functioning';
+}
+function stateLabel(s) {
+  if (s === 'functioning')    return 'FUNCTIONING';
+  if (s === 'malfunctioning') return 'MALFUNCTIONING';
+  return 'UNKNOWN';
+}
+function stateTone(s) {
+  if (s === 'functioning')    return 'safe';
+  if (s === 'malfunctioning') return 'critical';
+  return 'moderate';
+}
+
+function formatDuration(ms){
+  const total = Math.max(0, Math.floor(ms / 1000));
+  const d = Math.floor(total / 86400);
+  const h = Math.floor((total % 86400) / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  return `${d}d ${h}h ${m}m`;
+}
 
 function renderSensors() {
   const select = $('#sensorRoomSelect');
@@ -818,45 +1079,72 @@ function renderSensors() {
   select.innerHTML = classrooms.map(r => `<option value="${r.id}" ${r.id === selectedRoom ? 'selected' : ''}>${r.id} — ${r.name}</option>`).join('');
 
   const r = room(); if (!r) return;
-  const tempOk     = inputAvailable(r.temperature);
-  const humidityOk = inputAvailable(r.humidity);
-  const co2Ok      = inputAvailable(r.co2);
-  const pmOk       = inputAvailable(r.pm25);
-  const pirOk      = inputAvailable(r.occupancy);
+
+  const tempState = sensorStateFromValue(r.temperature);
+  const humState  = sensorStateFromValue(r.humidity);
+  const co2State  = sensorStateFromValue(r.co2);
+  const pmState   = sensorStateFromValue(r.pm25);
+  const pirState  = r.occupancy === null ? 'unknown' : 'functioning';
 
   const lastSeenMs = r.device?.last_seen || 0;
   const secSince   = lastSeenMs ? Math.round((now() - lastSeenMs) / 1000) : null;
   const onlineOk   = r.device?.online === true;
+  const espState   = r.device?.hasTimestamp === false ? 'unknown'
+    : (onlineOk ? 'functioning' : 'malfunctioning');
+
+  const dhtCombined =
+    (tempState === 'functioning' || humState === 'functioning') ? 'functioning' :
+    (tempState === 'malfunctioning' || humState === 'malfunctioning') ? 'malfunctioning' : 'unknown';
 
   const devices = [
-    { name:'ESP32 Controller', model:`Device ${r.device?.device_id || '—'} · uptime ${formatDuration(r.device?.uptime_ms || 0)}`,
-      value: onlineOk ? 'ONLINE' : 'OFFLINE',
-      state: onlineOk ? 'ONLINE' : 'OFFLINE',
-      tone: onlineOk ? 'safe' : 'critical',
-      detail: secSince === null ? 'No timestamp received yet.' : `Last telemetry ${secSince}s ago` },
-    { name:'DHT22', model:'Temperature and relative humidity',
-      value:`Temp: ${tempOk ? Number(r.temperature).toFixed(1)+' °C' : 'No input'} · RH: ${humidityOk ? Number(r.humidity)+'%' : 'No input'}`,
-      state: sensorState(tempOk && humidityOk).label,
-      tone: tempOk && humidityOk ? 'safe' : 'critical',
-      detail: tempOk && humidityOk ? 'Both inputs present.' : 'One or both inputs missing.' },
-    { name:'MH-Z19C', model:'CO₂ concentration',
-      value: co2Ok ? `${r.co2} ppm` : 'No CO₂ input',
-      state: sensorState(co2Ok).label, tone: co2Ok ? 'safe' : 'critical',
-      detail: co2Ok ? 'Numeric CO₂ reading present.' : 'CO₂ reading missing.' },
-    { name:'PMS5003', model:'PM2.5 particulate matter',
-      value: pmOk ? `${r.pm25} µg/m³` : 'No PM2.5 input',
-      state: sensorState(pmOk).label, tone: pmOk ? 'safe' : 'critical',
-      detail: pmOk ? 'Numeric PM2.5 reading present.' : 'PM2.5 reading missing.' },
-    { name:'PIR Sensor HC-SR501', model:'Motion / occupancy input',
-      value: pirOk ? (r.occupancy > 0 ? 'MOTION DETECTED' : 'NO MOTION') : 'No occupancy input',
-      state: sensorState(pirOk).label, tone: pirOk ? 'safe' : 'critical',
-      detail: pirOk ? 'Motion telemetry present.' : 'Occupancy input missing.' }
+    {
+      name: 'ESP32 Controller',
+      model: `Device ${r.device?.device_id || '—'} · uptime ${formatDuration(r.device?.uptime_ms || 0)}`,
+      value: r.device?.hasTimestamp ? (onlineOk ? 'ONLINE' : 'STALE') : 'NEVER REPORTED',
+      state: stateLabel(espState),
+      tone: stateTone(espState),
+      detail: secSince === null ? 'No timestamp received yet.' : `Last telemetry ${secSince}s ago`
+    },
+    {
+      name: 'DHT22',
+      model: 'Temperature and relative humidity',
+      value: `Temp: ${fmtOr(r.temperature, v => Number(v).toFixed(1) + ' °C')} · RH: ${fmtOr(r.humidity, v => v + '%')}`,
+      state: stateLabel(dhtCombined),
+      tone: stateTone(dhtCombined),
+      detail: (tempState === 'unknown' && humState === 'unknown')
+        ? 'No temperature or humidity received.'
+        : 'At least one DHT22 input present.'
+    },
+    {
+      name: 'MH-Z19C',
+      model: 'CO₂ concentration',
+      value: fmtOr(r.co2, v => v + ' ppm'),
+      state: stateLabel(co2State),
+      tone: stateTone(co2State),
+      detail: co2State === 'unknown' ? 'No CO₂ reading received.' : 'Numeric CO₂ reading present.'
+    },
+    {
+      name: 'PMS5003',
+      model: 'PM2.5 particulate matter',
+      value: fmtOr(r.pm25, v => v + ' µg/m³'),
+      state: stateLabel(pmState),
+      tone: stateTone(pmState),
+      detail: pmState === 'unknown' ? 'No PM2.5 reading received.' : 'Numeric PM2.5 reading present.'
+    },
+    {
+      name: 'PIR Sensor HC-SR501',
+      model: 'Motion / occupancy input',
+      value: r.occupancy === null ? 'No reading' : (r.occupancy === 1 ? 'MOTION DETECTED' : 'NO MOTION'),
+      state: stateLabel(pirState),
+      tone: stateTone(pirState),
+      detail: pirState === 'unknown' ? 'No motion telemetry received.' : 'Motion telemetry present.'
+    }
   ];
 
   if ($('#sensorSummary')) $('#sensorSummary').innerHTML = devices.map(d => `
     <article class="panel sensor-card">
       <div class="sensor-card-top">
-        <span class="sensor-device-icon">${d.name.startsWith('ESP32')?'▦':d.name==='DHT22'?'℃':d.name==='MH-Z19C'?'◉':d.name==='PMS5003'?'▤':'⌁'}</span>
+        <span class="sensor-device-icon">${d.name.startsWith('ESP32') ? '▦' : d.name === 'DHT22' ? '℃' : d.name === 'MH-Z19C' ? '◉' : d.name === 'PMS5003' ? '▤' : '⌁'}</span>
         <span class="sensor-status-pill ${d.tone}">${d.state}</span>
       </div>
       <h4>${d.name}</h4>
@@ -871,137 +1159,202 @@ function renderSensors() {
       <span class="sensor-status-pill ${d.tone}">${d.state}</span>
     </div>`).join('');
 
-  updateSensorUptime(r.id, devices);
-  renderSensorUptime(r.id, devices);
-  if ($('#sensorCheckedAt')) $('#sensorCheckedAt').textContent = `Updated ${new Date().toLocaleTimeString('en-PH', {hour:'2-digit', minute:'2-digit', second:'2-digit', hour12:false})}`;
-}
+  if ($('#sensorCheckedAt')) $('#sensorCheckedAt').textContent =
+    `Updated ${new Date().toLocaleTimeString('en-PH', {hour:'2-digit', minute:'2-digit', second:'2-digit', hour12:false})}`;
 
-const SENSOR_UPTIME_KEY = 'puriair_sensor_uptime_v1';
-function loadSensorUptime(){ try { return JSON.parse(localStorage.getItem(SENSOR_UPTIME_KEY)||'{}'); } catch { return {}; } }
-function saveSensorUptime(data){ localStorage.setItem(SENSOR_UPTIME_KEY, JSON.stringify(data)); }
-function updateSensorUptime(roomId, devices){
- const all=loadSensorUptime(), t=now(); all[roomId]=all[roomId]||{};
- devices.forEach(d=>{
-   const key=d.name; const up=d.tone!=='critical'; let rec=all[roomId][key];
-   if(!rec){ rec={status:up?'up':'down', since:t, firstSeen:t, upMs:0, downMs:0, events:[{at:t,status:up?'UP':'DOWN',note:'First observed by dashboard'}]}; }
-   else if((rec.status==='up')!==up){ const elapsed=Math.max(0,t-rec.since); if(rec.status==='up') rec.upMs+=elapsed; else rec.downMs+=elapsed; rec.status=up?'up':'down'; rec.since=t; rec.events=rec.events||[]; rec.events.unshift({at:t,status:up?'UP':'DOWN',note:`Status changed to ${up?'available':'unavailable'}`}); rec.events=rec.events.slice(0,30); }
-   rec.lastSeen=t; rec.currentUp=up; all[roomId][key]=rec;
- }); saveSensorUptime(all);
-}
-function renderSensorUptime(roomId, devices){
- const sum = $('#sensorUptimeSummary'); const hist = $('#sensorUptimeHistory');
- if (!sum || !hist) return;
- const all=loadSensorUptime(), data=all[roomId]||{}, t=now();
- sum.innerHTML=devices.map(d=>{const rec=data[d.name];if(!rec)return '';const up=rec.status==='up';const elapsed=Math.max(0,t-rec.since);const upMs=rec.upMs+(up?elapsed:0),downMs=rec.downMs+(!up?elapsed:0),total=upMs+downMs,pct=total?Math.round(upMs/total*100):100;return `<article class="panel sensor-card"><div class="sensor-card-top"><h4>${d.name}</h4><span class="sensor-status-pill ${up?'safe':'critical'}">${up?'UP':'DOWN'}</span></div><strong class="sensor-reading">${pct}% observed uptime</strong><small>Up: ${formatDuration(upMs)} · Down: ${formatDuration(downMs)}</small><small>First observed: ${new Date(rec.firstSeen).toLocaleString()}</small></article>`}).join('');
- const events=devices.flatMap(d=>(data[d.name]?.events||[]).map(e=>({...e,device:d.name}))).sort((a,b)=>b.at-a.at).slice(0,25);
- hist.innerHTML=events.length?events.map(e=>`<div class="sensor-diagnostic-row"><div><strong>${e.device} · ${e.status}</strong><small>${new Date(e.at).toLocaleString()} · ${e.note}</small></div><span class="sensor-status-pill ${e.status==='UP'?'safe':'critical'}">${e.status}</span></div>`).join(''):'<p class="management-note">Uptime events will appear after sensors are first observed.</p>';
-}
-
-const FILTER_RULES = {
-  pre:    { name:'Pre-filter',   min:1, max:3,  unit:'month', action:'Clean every 1–3 months' },
-  hepa:   { name:'HEPA filter',  min:6, max:12, unit:'month', action:'Replace every 6–12 months' },
-  carbon: { name:'Carbon filter',min:3, max:6,  unit:'month', action:'Replace every 3–6 months' }
-};
-function loadFilterRecords(){ try { return JSON.parse(localStorage.getItem('puriair_filter_records')||'{}'); } catch { return {}; } }
-function saveFilterRecords(data){ localStorage.setItem('puriair_filter_records', JSON.stringify(data)); }
-function addMonths(dateString, months){ const d=new Date(dateString+'T12:00:00'); d.setMonth(d.getMonth()+months); return d; }
-function fmtDate(d){ return d.toLocaleDateString('en-PH',{year:'numeric',month:'short',day:'numeric'}); }
-
-function renderPurifier(){
-  const select=$('#purifierRoomSelect'); if(!select) return;
-  if(!classrooms.length){select.innerHTML='';if($('#purifierSummary'))$('#purifierSummary').innerHTML='<article class="panel sensor-empty">No classrooms assigned yet.</article>';if($('#filterForecast'))$('#filterForecast').innerHTML='';if($('#filterHistory'))$('#filterHistory').innerHTML='';return;}
-  if(!classrooms.some(r=>r.id===selectedRoom)) selectedRoom=classrooms[0].id;
-  select.innerHTML=classrooms.map(r=>`<option value="${r.id}" ${r.id===selectedRoom?'selected':''}>${r.id} — ${r.name}</option>`).join('');
-  const r=room(); if(!r) return;
-  const data=loadFilterRecords(); const roomData=data[r.id]||{};
-
-  const cards=[
-    ['Purifier fan','Fan speed',`${r.purifier?'Active':'Standby'}`,r.purifier?'safe':'moderate','Live state derived from air quality and ESP32 purifier flag.'],
-    ['Humidification','Atomizer module',`Status: ${r.humidity<45?'Active':'Standby'}`,r.humidity<45?'safe':'moderate','Atomizer activity is inferred from humidity.'],
-    ['Humidification tank','Water level',`Level: not connected`, 'moderate','Tank level requires a float switch or manual update.'],
-    ['Dehumidification','TEC1-12706 Peltier', 'Status: Not verified', 'moderate','Requires electrical/current or controller feedback to confirm operation.'],
-    ['Thermal management','Heatsink & cooling fan','Temperature: not connected','moderate','Overheating cannot be detected without a temperature probe on/near the assembly.'],
-    ['Collected water','Dehumidification reservoir','Level: not connected','moderate','Add a float/level sensor or update manually; empty before overflow.']
-  ];
-  if($('#purifierSummary')) $('#purifierSummary').innerHTML=cards.map(c=>`<article class="panel sensor-card"><div class="sensor-card-top"><span class="sensor-device-icon">◉</span><span class="sensor-status-pill ${c[3]}">${c[3]==='safe'?'ACTIVE / OK':'DEMO / CHECK'}</span></div><h4>${c[0]}</h4><p>${c[1]}</p><strong class="sensor-reading">${c[2]}</strong><small>${c[4]}</small></article>`).join('');
-
-  const forecasts=Object.keys(FILTER_RULES).map(k=>{
-    const rule=FILTER_RULES[k], rec=(roomData[k]||[]).slice(-1)[0];
-    if(!rec) return {k,rule,rec:null,earliest:null,latest:null,due:null};
-    const earliest=addMonths(rec.date,rule.min),latest=addMonths(rec.date,rule.max);
-    let due=latest;
-    if(rec.condition==='moderate') due=earliest;
-    if(rec.condition==='critical'||rec.condition==='damaged') due=new Date();
-    return {k,rule,rec,earliest,latest,due};
-  });
-  if($('#filterForecast')) $('#filterForecast').innerHTML=forecasts.map(f=>{
-    let status='No service record yet';let tone='moderate';let forecast='Log the last cleaning/replacement date and condition to calculate an exact suggested date.';
-    if(f.rec){
-      const t=new Date();
-      status=f.rec.condition.toUpperCase();
-      tone=f.rec.condition==='good'?'safe':f.rec.condition==='moderate'?'moderate':'critical';
-      const dueDate=f.due;
-      const dueText=(f.rec.condition==='critical'||f.rec.condition==='damaged')?'Immediate service recommended — '+fmtDate(dueDate):`Suggested service date: ${fmtDate(dueDate)}`;
-      forecast=`${dueText}. Routine service window: ${fmtDate(f.earliest)} – ${fmtDate(f.latest)}.`;
-      if(t>f.latest && f.rec.condition!=='critical'&&f.rec.condition!=='damaged') forecast+=' Routine interval has passed; service is due now.';
-      if(f.rec.condition==='moderate')forecast+=' Moderate condition uses the earliest routine date.';
-      if(f.rec.condition==='good')forecast+=' Good condition uses the latest routine date.';
-    }
-    return `<article class="panel filter-forecast-card"><div class="sensor-card-top"><h4>${f.rule.name}</h4><span class="sensor-status-pill ${tone}">${status}</span></div><p>${f.rule.action}</p><strong>${f.rec?'Last action: '+f.rec.action+' · '+fmtDate(new Date(f.rec.date+'T12:00:00')):'No date recorded'}</strong><strong class="filter-due-date">${f.rec?'Next recommended date: '+fmtDate(f.due):'Next recommended date: not available'}</strong><small>${forecast}</small></article>`;
-  }).join('');
-
-  const records=Object.entries(roomData).flatMap(([k,arr])=>arr.map(rec=>({...rec,type:k}))).sort((a,b)=>b.created-a.created);
-  if($('#filterHistory')) $('#filterHistory').innerHTML=records.length?records.map(rec=>`<div class="sensor-diagnostic-row"><div><strong>${FILTER_RULES[rec.type].name} · ${rec.action}</strong><small>${fmtDate(new Date(rec.date+'T12:00:00'))} · Condition: ${rec.condition} · ${rec.notes||'No notes'}</small></div><span class="sensor-status-pill ${rec.condition==='good'?'safe':rec.condition==='moderate'?'moderate':'critical'}">${rec.condition.toUpperCase()}</span></div>`).join(''):'<p class="management-note">No filter maintenance records yet.</p>';
+  const uptimeSum  = $('#sensorUptimeSummary');
+  const uptimeHist = $('#sensorUptimeHistory');
+  if (uptimeSum)  uptimeSum.innerHTML  = '<p class="management-note">Uptime tracking is disabled in this version — only real Firebase timestamps are shown above.</p>';
+  if (uptimeHist) uptimeHist.innerHTML = '';
 }
 
 /* =========================================================
-   10. DATABASE EXPORT
+   11. PURIFIER PAGE
    ========================================================= */
-const BLOCK_DAYS = 10;
-const DB_STORAGE_KEY = 'puriair_db_blocks_v1';
-function blockIndexFromDate(date) { const ms = new Date(date).setHours(0,0,0,0); const epoch = new Date(1970,0,1).getTime(); return Math.floor((ms - epoch) / (BLOCK_DAYS * 86400000)); }
-function blockRangeFromIndex(index) { const epoch = new Date(1970,0,1).getTime(); const start = new Date(epoch + index * BLOCK_DAYS * 86400000); const end = new Date(start.getTime() + (BLOCK_DAYS - 1) * 86400000); return { start, end }; }
-function blockId(classroomId, blockIndex) { return `${classroomId}__block_${String(blockIndex).padStart(4, '0')}`; }
-function fmtBlockRange(index) { const { start, end } = blockRangeFromIndex(index); const opts = { year: 'numeric', month: 'short', day: 'numeric' }; return `${start.toLocaleDateString('en-PH', opts)} – ${end.toLocaleDateString('en-PH', opts)}`; }
-function loadDbBlocks() { try { return JSON.parse(localStorage.getItem(DB_STORAGE_KEY) || '{}'); } catch { return {}; } }
-function saveDbBlocks(data) { try { localStorage.setItem(DB_STORAGE_KEY, JSON.stringify(data)); } catch {} }
-function seededRandom(seedStr) { let h = 2166136261; for (let i = 0; i < seedStr.length; i++) { h ^= seedStr.charCodeAt(i); h = Math.imul(h, 16777619); } return function () { h += 0x6D2B79F5; let t = h; t = Math.imul(t ^ (t >>> 15), t | 1); t ^= t + Math.imul(t ^ (t >>> 7), t | 61); return ((t ^ (t >>> 14)) >>> 0) / 4294967296; }; }
-function generateTelemetryBlock(classroomId, blockIndex) {
-  const key = blockId(classroomId, blockIndex) + '__telemetry';
-  const stored = loadDbBlocks()[key];
-  if (stored) return stored;
-  const rnd = seededRandom(key);
-  const { start } = blockRangeFromIndex(blockIndex);
-  const rows = [];
-  const base = classrooms.find(c => c.id === classroomId) || { co2: 700, pm25: 10, humidity: 52, temperature: 25.5, occupancy: 15 };
-  const hours = BLOCK_DAYS * 24;
-  for (let h = 0; h < hours; h++) {
-    const ts = new Date(start.getTime() + h * 3600000);
-    const hourOfDay = ts.getHours();
-    const dayFactor = Math.sin(((hourOfDay - 6) / 24) * Math.PI * 2) * 0.5 + 0.5;
-    const weekend = [0, 6].includes(ts.getDay());
-    const occBase = weekend ? 2 : 20;
-    const occupancy = Math.max(0, Math.round(occBase * dayFactor + (rnd() - 0.5) * 6));
-    const co2 = Math.round(420 + occupancy * 28 + rnd() * 120);
-    const pm25 = Math.round((base.pm25 * 0.4 + occupancy * 0.5 + rnd() * 6) * 10) / 10;
-    const humidity = Math.round(base.humidity + (rnd() - 0.5) * 14);
-    const temperature = Math.round((base.temperature + dayFactor * 2 + (rnd() - 0.5) * 1.5) * 10) / 10;
-    const penalty = Math.max(0, (co2 - 500) / 35) + Math.max(0, (pm25 - 8) * 1.2) + Math.max(0, (humidity - 65) * 0.7);
-    const chi = Math.max(20, Math.min(98, Math.round(96 - penalty - occupancy * 0.05)));
-    rows.push({ timestamp: ts.toISOString(), classroom: classroomId, chi,
-      status: chi >= 80 ? 'safe' : chi >= 60 ? 'moderate' : chi >= 40 ? 'poor' : 'critical',
-      co2, pm25, temperature, humidity, occupancy, purifier: (co2 > 1000 || pm25 > 20) ? 'ON' : 'OFF' });
+function renderPurifier() {
+  const select = $('#purifierRoomSelect');
+  if (!select) return;
+
+  if (!classrooms.length) {
+    select.innerHTML = '';
+    if ($('#purifierSummary')) $('#purifierSummary').innerHTML = '<article class="panel sensor-empty">No classrooms assigned yet.</article>';
+    if ($('#filterForecast')) $('#filterForecast').innerHTML = '';
+    if ($('#filterHistory')) $('#filterHistory').innerHTML = '';
+    return;
   }
-  const all = loadDbBlocks(); all[key] = rows; saveDbBlocks(all); return rows;
+
+  if (!classrooms.some(r => r.id === selectedRoom)) selectedRoom = classrooms[0].id;
+  select.innerHTML = classrooms.map(r => `<option value="${r.id}" ${r.id === selectedRoom ? 'selected' : ''}>${r.id} — ${r.name}</option>`).join('');
+
+  const r = room(); if (!r) return;
+
+  const status = r.device?.raw?.status || null;
+  const control = r.device?.raw?.control || null;
+
+  const cards = [
+    {
+      name: 'Purifier fan',
+      model: 'Relay-controlled DC blower',
+      value: status?.purifierFan === true ? 'ACTIVE'
+           : status?.purifierFan === false ? 'OFF'
+           : 'No status reported',
+      tone: status?.purifierFan === true ? 'safe'
+          : status?.purifierFan === false ? 'moderate'
+          : 'moderate',
+      note: status ? 'Reported by ESP32 /status node.' : 'ESP32 has never published /status.'
+    },
+    {
+      name: 'Humidifier (atomizer)',
+      model: 'Relay-controlled atomizer',
+      value: status?.humidifier === true ? 'ACTIVE'
+           : status?.humidifier === false ? 'OFF'
+           : 'No status reported',
+      tone: status?.humidifier === true ? 'safe'
+          : status?.humidifier === false ? 'moderate'
+          : 'moderate',
+      note: status ? 'Reported by ESP32 /status node.' : 'ESP32 has never published /status.'
+    },
+    {
+      name: 'Dehumidifier (Peltier)',
+      model: 'TEC1-12706 with heatsink fan',
+      value: status?.dehumidifier === true ? 'ACTIVE'
+           : status?.dehumidifier === false ? 'OFF'
+           : 'No status reported',
+      tone: status?.dehumidifier === true ? 'safe'
+          : status?.dehumidifier === false ? 'moderate'
+          : 'moderate',
+      note: status ? 'Reported by ESP32 /status node.' : 'ESP32 has never published /status.'
+    },
+    {
+      name: 'Master power',
+      model: 'Main system enable',
+      value: status?.power === true ? 'ON'
+           : status?.power === false ? 'OFF'
+           : 'No status reported',
+      tone: status?.power === true ? 'safe'
+          : status?.power === false ? 'moderate'
+          : 'moderate',
+      note: status ? 'Reported by ESP32 /status node.' : 'ESP32 has never published /status.'
+    },
+    {
+      name: 'Operating mode',
+      model: 'Auto vs Manual',
+      value: status?.mode ? String(status.mode).toUpperCase() : 'No status reported',
+      tone: status?.mode ? 'safe' : 'moderate',
+      note: status ? 'Reported by ESP32 /status node.' : 'ESP32 has never published /status.'
+    },
+    {
+      name: 'Last command received',
+      model: 'Latest /control write',
+      value: control ? `Mode ${control.mode || '—'} · PWR ${control.power ? 'ON' : 'OFF'}` : 'No control node',
+      tone: control ? 'safe' : 'moderate',
+      note: control ? 'Reflects the last command stored in Firebase.' : 'No /control has ever been written.'
+    }
+  ];
+
+  if ($('#purifierSummary')) {
+    $('#purifierSummary').innerHTML = cards.map(c => `
+      <article class="panel sensor-card">
+        <div class="sensor-card-top">
+          <span class="sensor-device-icon">◉</span>
+          <span class="sensor-status-pill ${c.tone}">${c.tone === 'safe' ? 'REPORTED' : 'NO DATA'}</span>
+        </div>
+        <h4>${c.name}</h4>
+        <p>${c.model}</p>
+        <strong class="sensor-reading">${c.value}</strong>
+        <small>${c.note}</small>
+      </article>`).join('');
+  }
+
+  if ($('#filterForecast')) {
+    $('#filterForecast').innerHTML = '<p class="management-note">Filter service intervals are not configured. Add records below and they will appear here.</p>';
+  }
+
+  const records = loadFilterRecords()[r.id] || {};
+  const all = Object.entries(records).flatMap(([k, arr]) =>
+    (arr || []).map(rec => ({ ...rec, type: k }))
+  ).sort((a, b) => (b.created || 0) - (a.created || 0));
+
+  if ($('#filterHistory')) {
+    $('#filterHistory').innerHTML = all.length
+      ? all.map(rec => `
+        <div class="sensor-diagnostic-row">
+          <div>
+            <strong>${(rec.type || '').toUpperCase()} · ${rec.action || ''}</strong>
+            <small>${rec.date || ''} · Condition: ${rec.condition || '—'} · ${rec.notes || 'No notes'}</small>
+          </div>
+          <span class="sensor-status-pill ${rec.condition === 'good' ? 'safe' : rec.condition === 'moderate' ? 'moderate' : 'critical'}">${(rec.condition || 'unknown').toUpperCase()}</span>
+        </div>`).join('')
+      : '<p class="management-note">No filter maintenance records yet.</p>';
+  }
 }
-function escapeXml(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&apos;'); }
+
+/* =========================================================
+   12. DATABASE LOGS
+   ========================================================= */
+function fetchDailyTelemetry(deviceId, dateStr) {
+  return new Promise((resolve, reject) => {
+    if (!firebaseReady || !db) { reject(new Error('Firebase not connected')); return; }
+
+    const path = `devices/${deviceId}/readings/${dateStr}`;
+    db.ref(path).once('value')
+      .then(snap => {
+        const day = snap.val() || {};
+        const rows = [];
+
+        Object.entries(day).forEach(([timeKey, rec]) => {
+          if (!rec || typeof rec !== 'object') return;
+
+          const ts = numOrNull(rec.timestamp_ms);
+          if (!ts || ts < 1700000000000) return;
+
+          rows.push({
+            timestamp:   new Date(ts).toISOString(),
+            date:        rec.date || dateStr,
+            time:        rec.time || timeKey.replace(/-/g, ':'),
+            classroom:   deviceId,
+            temperature_C: numOrNull(rec.temperature_C),
+            humidity_pct:  numOrNull(rec.humidity_pct),
+            pm25_ug_m3:    numOrNull(rec.pm25_ug_m3),
+            co2_ppm:       numOrNull(rec.co2_ppm),
+            motion:        rec.motion === true ? 1 : 0
+          });
+        });
+
+        rows.sort((a, b) => a.timestamp < b.timestamp ? -1 : a.timestamp > b.timestamp ? 1 : 0);
+        resolve(rows);
+      })
+      .catch(reject);
+  });
+}
+
 function rowsToExcelXml(rows, sheetName) {
-  if (!rows.length) return `<?xml version="1.0"?>\n<?mso-application progid="Excel.Sheet"?>\n<Workbook xmlns="urn:schemas-microsoft-com:office:spreadsheet" xmlns:ss="urn:schemas-microsoft-com:office:spreadsheet"><Worksheet ss:Name="${escapeXml(sheetName)}"><Table><Row><Cell><Data ss:Type="String">No data</Data></Cell></Row></Table></Worksheet></Workbook>`;
+  if (!rows.length) {
+    return `<?xml version="1.0"?>\n<?mso-application progid="Excel.Sheet"?>\n<Workbook xmlns="urn:schemas-microsoft-com:office:spreadsheet" xmlns:ss="urn:schemas-microsoft-com:office:spreadsheet"><Worksheet ss:Name="${escapeXml(sheetName)}"><Table><Row><Cell><Data ss:Type="String">No data</Data></Cell></Row></Table></Worksheet></Workbook>`;
+  }
   const headers = Object.keys(rows[0]);
   const headerCells = headers.map(h => `<Cell ss:StyleID="hdr"><Data ss:Type="String">${escapeXml(h)}</Data></Cell>`).join('');
-  const bodyRows = rows.map(r => { const cells = headers.map(h => { const v = r[h]; const isNum = typeof v === 'number' && isFinite(v); const type = isNum ? 'Number' : 'String'; return `<Cell><Data ss:Type="${type}">${escapeXml(v)}</Data></Cell>`; }).join(''); return `<Row>${cells}</Row>`; }).join('');
+  const bodyRows = rows.map(r => {
+    const cells = headers.map(h => {
+      const v = r[h];
+      if (v === null || v === undefined) {
+        return `<Cell><Data ss:Type="String">No reading</Data></Cell>`;
+      }
+      const isNum = typeof v === 'number' && isFinite(v);
+      const type = isNum ? 'Number' : 'String';
+      return `<Cell><Data ss:Type="${type}">${escapeXml(v)}</Data></Cell>`;
+    }).join('');
+    return `<Row>${cells}</Row>`;
+  }).join('');
   return `<?xml version="1.0"?>\n<?mso-application progid="Excel.Sheet"?>\n<Workbook xmlns="urn:schemas-microsoft-com:office:spreadsheet" xmlns:ss="urn:schemas-microsoft-com:office:spreadsheet"><Styles><Style ss:ID="hdr"><Font ss:Bold="1" ss:Color="#FFFFFF"/><Interior ss:Color="#7B1113" ss:Pattern="Solid"/></Style></Styles><Worksheet ss:Name="${escapeXml(sheetName)}"><Table><Row>${headerCells}</Row>${bodyRows}</Table></Worksheet></Workbook>`;
 }
+
+function escapeXml(s) {
+  return String(s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&apos;');
+}
+
 function downloadExcel(rows, filename, sheetName) {
   const xml = rowsToExcelXml(rows, sheetName || 'Logs');
   const blob = new Blob([xml], { type: 'application/vnd.ms-excel' });
@@ -1016,63 +1369,85 @@ function downloadExcel(rows, filename, sheetName) {
 function renderDatabase() {
   const roomSel = $('#databaseRoomSelect');
   if (!roomSel) return;
+
   if (!classrooms.length) {
     roomSel.innerHTML = '';
-    if ($('#databaseBlockList')) $('#databaseBlockList').innerHTML = '<p class="management-note">No classrooms assigned yet.</p>';
     if ($('#databaseBlockInfo')) $('#databaseBlockInfo').innerHTML = '';
-    if ($('#databaseBlockCount')) $('#databaseBlockCount').textContent = '0 blocks';
     return;
   }
+
   if (!classrooms.some(r => r.id === selectedRoom)) selectedRoom = classrooms[0].id;
-  roomSel.innerHTML = classrooms.map(r => `<option value="${r.id}" ${r.id === selectedRoom ? 'selected' : ''}>${r.id} — ${r.name}</option>`).join('');
+  roomSel.innerHTML = classrooms.map(r =>
+    `<option value="${r.id}" ${r.id === selectedRoom ? 'selected' : ''}>${r.id} — ${r.name}</option>`
+  ).join('');
+
   const dateInput = $('#databaseDate');
-  if (dateInput && !dateInput.value) dateInput.value = new Date().toISOString().slice(0, 10);
+  if (dateInput) {
+    const today = new Date();
+    const first = new Date(today.getFullYear(), today.getMonth(), 1);
+    const last  = new Date(today.getFullYear(), today.getMonth() + 1, 0);
+    const toISO = d => d.toISOString().slice(0, 10);
+    dateInput.min = toISO(first);
+    dateInput.max = toISO(last);
+    if (!dateInput.value) dateInput.value = toISO(today);
+  }
+
   updateDatabaseBlockInfo();
-  renderDatabaseBlockList();
 }
+
 function updateDatabaseBlockInfo() {
-  const roomId = $('#databaseRoomSelect')?.value;
+  const roomId  = $('#databaseRoomSelect')?.value;
   const dateVal = $('#databaseDate')?.value;
-  const info = $('#databaseBlockInfo'); if (!info) return;
+  const info = $('#databaseBlockInfo');
+  if (!info) return;
   if (!roomId || !dateVal) { info.innerHTML = ''; return; }
-  const idx = blockIndexFromDate(dateVal);
-  const key = blockId(roomId, idx) + '__telemetry';
-  const exists = !!loadDbBlocks()[key];
-  info.innerHTML = `Selected classroom: <strong>${escapeXml(roomId)}</strong><br>Target 10-day block: <strong>Block #${idx}</strong> · ${fmtBlockRange(idx)}<br>Log type: <strong>Environmental Telemetry</strong> · Status: <strong>${exists ? 'Stored locally' : 'Will be generated on download'}</strong>`;
+
+  const r = classrooms.find(x => x.id === roomId);
+  info.innerHTML = `
+    Selected classroom: <strong>${escapeXml(roomId)}</strong><br>
+    Assigned device: <strong>${escapeXml(r?.deviceId || '—')}</strong><br>
+    Target date: <strong>${escapeXml(dateVal)}</strong><br>
+    Source: <strong>Firebase /devices/&lt;deviceId&gt;/readings/${escapeXml(dateVal)}</strong>
+  `;
 }
-function renderDatabaseBlockList() {
-  const roomId = $('#databaseRoomSelect')?.value;
-  const list = $('#databaseBlockList'); const countEl = $('#databaseBlockCount');
-  if (!list) return;
-  if (!roomId) { list.innerHTML = ''; if (countEl) countEl.textContent = '0 blocks'; return; }
-  const blocks = loadDbBlocks();
-  const prefix = roomId + '__block_';
-  const relevant = Object.keys(blocks).filter(k => k.startsWith(prefix) && k.endsWith('__telemetry'))
-    .map(k => { const m = k.match(/__block_(\d+)__/); return { key: k, idx: m ? Number(m[1]) : 0, rows: blocks[k].length }; })
-    .sort((a, b) => b.idx - a.idx).slice(0, 12);
-  if (countEl) countEl.textContent = `${relevant.length} block${relevant.length === 1 ? '' : 's'}`;
-  if (!relevant.length) { list.innerHTML = `<p class="management-note">No telemetry blocks stored for ${roomId} yet. Download one to generate it.</p>`; return; }
-  list.innerHTML = relevant.map(b => `<div class="database-block-row"><div><strong>Block #${b.idx} · ${fmtBlockRange(b.idx)}</strong><small>${b.rows} rows · ${b.key}</small></div><span class="database-block-tag">STORED</span></div>`).join('');
-}
-function handleDatabaseExport(e) {
+
+async function handleDatabaseExport(e) {
   e.preventDefault();
   if (!isAdmin()) { showToast('Access denied', 'Only administrators can export database logs.'); return; }
-  const roomId = $('#databaseRoomSelect').value;
-  const dateVal = $('#databaseDate').value;
-  if (!roomId || !dateVal) { showToast('Missing parameters', 'Select a classroom and date.'); return; }
-  const idx = blockIndexFromDate(dateVal);
-  const rows = generateTelemetryBlock(roomId, idx);
-  const { start, end } = blockRangeFromIndex(idx);
-  const startStr = start.toISOString().slice(0, 10);
-  const endStr = end.toISOString().slice(0, 10);
-  downloadExcel(rows, `${roomId}_telemetry_block${idx}_${startStr}_to_${endStr}.xls`, `${roomId} telemetry`.slice(0, 28));
-  showToast('Download ready', `${rows.length} telemetry rows for ${roomId} · Block #${idx}.`);
-  updateDatabaseBlockInfo();
-  renderDatabaseBlockList();
+
+  const classroomId = $('#databaseRoomSelect').value;
+  const dateVal     = $('#databaseDate').value;
+  if (!classroomId || !dateVal) { showToast('Missing parameters', 'Select a classroom and date.'); return; }
+
+  const r = classrooms.find(x => x.id === classroomId);
+  if (!r || !r.deviceId) { showToast('No device', `Classroom ${classroomId} has no device assigned.`); return; }
+
+  const today = new Date();
+  const yyyy = today.getFullYear();
+  const mm   = String(today.getMonth() + 1).padStart(2, '0');
+  if (!dateVal.startsWith(`${yyyy}-${mm}`)) {
+    showToast('Out of range', 'Only the current month is downloadable.');
+    return;
+  }
+
+  showToast('Fetching…', `Reading Firebase history for ${r.deviceId} on ${dateVal}…`);
+
+  try {
+    const rows = await fetchDailyTelemetry(r.deviceId, dateVal);
+    if (!rows.length) {
+      showToast('No data', `No history recorded for ${classroomId} on ${dateVal}.`);
+      return;
+    }
+    downloadExcel(rows, `${classroomId}_telemetry_${dateVal}.xls`, `${classroomId} ${dateVal}`.slice(0, 28));
+    showToast('Download ready', `${rows.length} rows for ${classroomId} on ${dateVal}.`);
+  } catch (err) {
+    console.error('[PuriAir] export failed:', err);
+    showToast('Export failed', err.message || 'See console.');
+  }
 }
 
 /* =========================================================
-   11. NAVIGATION
+   13. NAVIGATION
    ========================================================= */
 function navigate(page) {
   if (!isAdmin() && ADMIN_ONLY_PAGES.includes(page)) {
@@ -1096,7 +1471,7 @@ function navigate(page) {
 }
 
 /* =========================================================
-   12. TOAST / CLOCK
+   14. TOAST / CLOCK
    ========================================================= */
 function showToast(title, message) {
   const t = $('#toast'); if (!t) { console.log('[toast]', title, message); return; }
@@ -1112,23 +1487,13 @@ function updateClock() {
 }
 
 /* =========================================================
-   13. ADMIN PURIFIER CONTROL
-   =========================================================
-   Field contract with the ESP32 firmware (/control node):
-     mode          : "auto" | "manual"
-     power         : boolean
-     purifierFan   : boolean
-     humidifier    : boolean
-     dehumidifier  : boolean
+   15. ADMIN PURIFIER CONTROL
    ========================================================= */
-
 function pushControlUpdate(updates) {
   const r = room();
   if (!r) return Promise.reject(new Error('No classroom selected.'));
 
   const devId = r.deviceId;
-
-  /* ─── CHANGED ─── mark fields as pending so snapshots don't clobber */
   Object.keys(updates).forEach(k => { pendingWrites[k] = Date.now(); });
 
   if (!firebaseReady || !db) {
@@ -1139,10 +1504,7 @@ function pushControlUpdate(updates) {
   }
 
   return db.ref(`devices/${devId}/control`).update(updates)
-    .then(() => {
-      Object.assign(purifierControlState, updates);
-      applyControlToUi();
-    })
+    .then(() => { Object.assign(purifierControlState, updates); applyControlToUi(); })
     .catch(err => {
       console.error('[PuriAir] Control write failed:', err);
       showToast('Write failed', 'Could not send command to Firebase.');
@@ -1150,63 +1512,41 @@ function pushControlUpdate(updates) {
 }
 
 function toggleOperatingMode() {
-  if (!isAdmin()) {
-    showToast('Access denied', 'Only administrators can change purifier operating mode.');
-    return;
-  }
-
+  if (!isAdmin()) { showToast('Access denied', 'Only administrators can change mode.'); return; }
   const newMode = purifierControlState.mode === 'auto' ? 'manual' : 'auto';
-
-  if (newMode === 'auto') {
-    pushControlUpdate({ mode: 'auto' }).then(() => {
-      showToast('Automatic mode', 'The ESP32 now controls the purifier automatically.');
-    });
-  } else {
-    pushControlUpdate({ mode: 'manual' }).then(() => {
-      showToast('Manual mode', 'You now control the purifier switches.');
-    });
-  }
-}
-
-function togglePower() {
-  if (!isAdmin() || purifierControlState.mode !== 'manual') return;
-  const newState = !purifierControlState.power;
-  pushControlUpdate({ power: newState }).then(() => {
-    showToast('Power ' + (newState ? 'ON' : 'OFF'), 'Master switch updated.');
+  pushControlUpdate({ mode: newMode }).then(() => {
+    showToast(newMode === 'auto' ? 'Automatic mode' : 'Manual mode',
+              newMode === 'auto' ? 'The ESP32 now controls the purifier automatically.'
+                                 : 'You now control the purifier switches.');
   });
 }
-
+function togglePower() {
+  if (!isAdmin() || purifierControlState.mode !== 'manual') return;
+  const s = !purifierControlState.power;
+  pushControlUpdate({ power: s }).then(() => showToast('Power ' + (s ? 'ON' : 'OFF'), 'Master switch updated.'));
+}
 function toggleFan() {
   if (!isAdmin() || purifierControlState.mode !== 'manual') return;
-  const newState = !purifierControlState.purifierFan;
-  pushControlUpdate({ purifierFan: newState });
+  pushControlUpdate({ purifierFan: !purifierControlState.purifierFan });
 }
-
 function toggleHumidifier() {
   if (!isAdmin() || purifierControlState.mode !== 'manual') return;
-
-  const newState = !purifierControlState.humidifier;
-  const updates = { humidifier: newState };
-
-  if (newState && purifierControlState.dehumidifier) {
+  const s = !purifierControlState.humidifier;
+  const updates = { humidifier: s };
+  if (s && purifierControlState.dehumidifier) {
     updates.dehumidifier = false;
     showToast('Dehumidifier disabled', 'Humidifier and dehumidifier cannot run together.');
   }
-
   pushControlUpdate(updates);
 }
-
 function toggleDehumidifier() {
   if (!isAdmin() || purifierControlState.mode !== 'manual') return;
-
-  const newState = !purifierControlState.dehumidifier;
-  const updates = { dehumidifier: newState };
-
-  if (newState && purifierControlState.humidifier) {
+  const s = !purifierControlState.dehumidifier;
+  const updates = { dehumidifier: s };
+  if (s && purifierControlState.humidifier) {
     updates.humidifier = false;
     showToast('Humidifier disabled', 'Humidifier and dehumidifier cannot run together.');
   }
-
   pushControlUpdate(updates);
 }
 
@@ -1214,10 +1554,8 @@ function applyControlToUi() {
   const isManual = purifierControlState.mode === 'manual' && isAdmin();
 
   const setToggle = (id, checked, disabled) => {
-    const el = $(id);
-    if (!el) return;
-    el.checked = checked;
-    el.disabled = disabled;
+    const el = $(id); if (!el) return;
+    el.checked = checked; el.disabled = disabled;
   };
 
   setToggle('#switchPower',        purifierControlState.power,          !isManual);
@@ -1235,8 +1573,7 @@ function applyControlToUi() {
   const override = $('#overrideButton');
   if (override) {
     override.textContent = purifierControlState.mode === 'manual'
-      ? 'Return to Automatic'
-      : 'Enable Manual Mode';
+      ? 'Return to Automatic' : 'Enable Manual Mode';
     override.setAttribute('aria-pressed', String(purifierControlState.mode === 'manual'));
     override.disabled = !isAdmin();
   }
@@ -1271,20 +1608,15 @@ function applyControlToUi() {
         help.textContent = '⏳ Waiting for device to confirm…';
         help.className = 'helper-text pending';
       } else {
-        help.textContent = '✓ Device confirmed. Humidifier and dehumidifier cannot both run.';
+        help.textContent = '✓ Device confirmed.';
         help.className = 'helper-text confirmed';
       }
     }
   }
 }
 
-/* ─── CHANGED ───
-   Respect pending writes: if a field was updated locally within the
-   last PENDING_WRITE_GRACE_MS milliseconds, do not overwrite it from
-   an incoming Firebase snapshot. Otherwise the toggle flickers. */
 function syncControlPanelFromDevice(r) {
   if (!r || !r.device) return;
-
   const ctrl = r.device.raw && r.device.raw.control;
   if (!ctrl) return;
 
@@ -1299,7 +1631,18 @@ function syncControlPanelFromDevice(r) {
 }
 
 /* =========================================================
-   14. EVENT LISTENERS
+   16. FILTER LOG
+   ========================================================= */
+function loadFilterRecords() {
+  try { return JSON.parse(localStorage.getItem('puriair_filter_records') || '{}'); }
+  catch { return {}; }
+}
+function saveFilterRecords(data) {
+  localStorage.setItem('puriair_filter_records', JSON.stringify(data));
+}
+
+/* =========================================================
+   17. EVENT LISTENERS
    ========================================================= */
 function wireListeners() {
   $$('.nav-item[data-page]').forEach(btn => btn.addEventListener('click', () => navigate(btn.dataset.page)));
@@ -1315,25 +1658,41 @@ function wireListeners() {
   $('#switchHumidifier')?.addEventListener('change', toggleHumidifier);
   $('#switchDehumidifier')?.addEventListener('change', toggleDehumidifier);
 
+  $('#chiBubbleBtn')?.addEventListener('click', openChiModal);
+  $('#closeChiModal')?.addEventListener('click', closeChiModal);
+  $('#chiModal')?.addEventListener('click', e => {
+    if (e.target.id === 'chiModal') closeChiModal();
+  });
+
   const fsd = $('#filterServiceDate');
-  if (fsd) fsd.value = new Date().toISOString().slice(0,10);
+  if (fsd) fsd.value = new Date().toISOString().slice(0, 10);
 
   $('#filterLogForm')?.addEventListener('submit', e => {
     e.preventDefault();
-    const key = selectedRoom; const type = $('#filterType').value;
+    const key = selectedRoom;
     if (!key) { showToast('No classroom selected', 'Assign a classroom first.'); return; }
+    const type = $('#filterType').value;
     const records = loadFilterRecords();
     records[key] = records[key] || {};
     records[key][type] = records[key][type] || [];
-    records[key][type].push({ date: $('#filterServiceDate').value, action: $('#filterAction').value, condition: $('#filterCondition').value, notes: $('#filterNotes').value.trim(), created: Date.now() });
+    records[key][type].push({
+      date: $('#filterServiceDate').value,
+      action: $('#filterAction').value,
+      condition: $('#filterCondition').value,
+      notes: $('#filterNotes').value.trim(),
+      created: Date.now()
+    });
     saveFilterRecords(records);
     $('#filterNotes').value = '';
     renderPurifier();
-    showToast('Maintenance saved', `${FILTER_RULES[type].name} record saved for ${key}.`);
+    showToast('Maintenance saved', `Record saved for ${key}.`);
   });
 
   $('#databaseExportForm')?.addEventListener('submit', handleDatabaseExport);
-  $('#databaseRoomSelect')?.addEventListener('change', () => { selectedRoom = $('#databaseRoomSelect').value; updateDatabaseBlockInfo(); renderDatabaseBlockList(); });
+  $('#databaseRoomSelect')?.addEventListener('change', () => {
+    selectedRoom = $('#databaseRoomSelect').value;
+    updateDatabaseBlockInfo();
+  });
   $('#databaseDate')?.addEventListener('change', updateDatabaseBlockInfo);
 
   $('#addClassroomButton')?.addEventListener('click', () => openClassroomModal('add'));
@@ -1356,7 +1715,7 @@ function wireListeners() {
 }
 
 /* =========================================================
-   15. CLASSROOM MANAGEMENT
+   18. CLASSROOM MANAGEMENT
    ========================================================= */
 function openClassroomModal(mode) {
   if (!isAdmin()) return;
@@ -1406,7 +1765,7 @@ function confirmAddClassroom() {
   if (Object.values(assignments).some(a => a.deviceId === devId)) { showToast('Device already paired', `${devId} is assigned elsewhere.`); return; }
 
   assignments[id] = { deviceId: devId, deviceName: `Classroom ${id}`, lastSynced: 0, updatedAt: Date.now() };
-  saveAssignments(assignments);   /* ─── CHANGED: writes to Firebase too ─── */
+  saveAssignments(assignments);
   closeClassroomModal();
   showToast('Classroom added', `${id} paired with ${devId}.`);
 
@@ -1422,7 +1781,7 @@ function confirmRemoveClassroom() {
   if (!assignments[id]) { showToast('Not found', 'Classroom not assigned.'); return; }
   const devId = assignments[id].deviceId;
   delete assignments[id];
-  saveAssignments(assignments);   /* ─── CHANGED: writes to Firebase too ─── */
+  saveAssignments(assignments);
   closeClassroomModal();
   showToast('Classroom removed', `${id} removed. Device ${devId} is available again.`);
   if (selectedRoom === id) selectedRoom = '';
@@ -1432,7 +1791,7 @@ function confirmRemoveClassroom() {
 }
 
 /* =========================================================
-   16. INITIALIZATION
+   19. INITIALIZATION
    ========================================================= */
 window.addEventListener('error', (e) => {
   console.error('[PuriAir global]', e.error || e.message);
@@ -1441,8 +1800,6 @@ window.addEventListener('error', (e) => {
 
 function init() {
   try {
-    /* First-paint: seed the cache from localStorage so the UI can
-       render immediately, before Firebase responds. */
     try {
       const cached = JSON.parse(localStorage.getItem(ASSIGNMENTS_KEY) || '{}');
       if (cached && typeof cached === 'object') assignmentsCache = cached;
@@ -1452,10 +1809,6 @@ function init() {
     applyRole();
     wireListeners();
     navigate('puriair');
-
-    /* attachFirebaseListeners() and attachAssignmentListener() are
-       now called from inside the auth callback (or immediately if
-       the auth SDK is missing), so they only run once auth is ready. */
 
     buildClassroomsFromAssignments();
     renderAllViews();
