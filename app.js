@@ -412,8 +412,12 @@ function normalizeDeviceToRoom(devId, node, assignment, lastSyncedMs) {
     conditionTemperature(temperature),
     conditionHumidity(humidity)
   ];
-  const statusText = roomStatusFromConditions(conds);
+
+  // 1. Calculate CHI FIRST
   const chi = computeCHI(co2, pm25, temperature, humidity);
+
+  // 2. Determine status based on the CHI score, not just the worst metric
+  const statusText = chi !== null ? conditionCHI(chi) : roomStatusFromConditions(conds);
 
   const tsMs = numOrNull(latest?.timestamp_ms) ?? 0;
   const hasTimestamp = tsMs > 0;
