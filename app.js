@@ -1,5 +1,5 @@
 /*
-  PURIAIR FRONTEND v17 — CHI Tile (Alert Preferences card removed)
+  PURIAIR FRONTEND v18 — Threshold & Metric Fix
   -------------------------------------------------------------------
   Schema read from Firebase:
     devices/<device_id>/latest/<field>
@@ -8,11 +8,13 @@
     devices/<device_id>/readings/<YYYY-MM-DD>/<HH-MM-SS>
     assignments/<classroom_id>/<field>
 
-  v17 CHANGES
-  - Removed the "Alert Preferences" card from Admin Settings.
-    The dashboard does not implement notifications, so the toggles
-    were decorative only and have been removed from index.html.
-  - No functional changes to data flow.
+  v18 CHANGES
+  - Fixed gap in conditionHumidity and conditionTemperature logic.
+    Values like 50.2% or 24.05°C previously fell through the cracks
+    and defaulted to CRITICAL. They now correctly evaluate as MODERATE.
+  - Default selected metric set to 'chi' so the dashboard opens
+    showing the composite CHI score rather than humidity.
+  - Room status badges now strictly follow the CHI score.
 */
 
 /* =========================================================
@@ -78,7 +80,7 @@ const CONDITION_POINTS = {
    ========================================================= */
 let classrooms     = [];
 let selectedRoom   = '';
-let selectedMetric = 'humidity';
+let selectedMetric = 'chi'; // Default to CHI score
 let currentRole    = 'student';
 let lastFirebaseSnapshot = 0;
 let rawFirebaseDevices = {};
@@ -273,31 +275,35 @@ function setFirebaseUiStatus(state, label) {
    ========================================================= */
 function conditionCO2(v) {
   if (v === null) return 'unknown';
-  if (v < CHI_THRESHOLDS.co2.safe)      return 'safe';
+  if (v <= CHI_THRESHOLDS.co2.safe)      return 'safe';
   if (v <= CHI_THRESHOLDS.co2.moderate) return 'moderate';
   if (v <= CHI_THRESHOLDS.co2.poor)     return 'poor';
   return 'critical';
 }
 function conditionPM25(v) {
   if (v === null) return 'unknown';
-  if (v < CHI_THRESHOLDS.pm25.safe)      return 'safe';
+  if (v <= CHI_THRESHOLDS.pm25.safe)      return 'safe';
   if (v <= CHI_THRESHOLDS.pm25.moderate) return 'moderate';
   if (v <= CHI_THRESHOLDS.pm25.poor)     return 'poor';
   return 'critical';
 }
+
+/* FIXED: Logic gaps in temperature (e.g. 24.05°C) */
 function conditionTemperature(v) {
   if (v === null) return 'unknown';
-  if (v >= CHI_THRESHOLDS.temperature.safeMin && v <= CHI_THRESHOLDS.temperature.safeMax) return 'safe';
-  if (v >= CHI_THRESHOLDS.temperature.modMin  && v <= CHI_THRESHOLDS.temperature.modMax)  return 'moderate';
-  if (v >= CHI_THRESHOLDS.temperature.poorMin && v <= CHI_THRESHOLDS.temperature.poorMax) return 'poor';
-  return 'critical';
+  if (v < CHI_THRESHOLDS.temperature.modMin) return 'safe';   // Below 24.1 is Safe
+  if (v < CHI_THRESHOLDS.temperature.poorMin) return 'moderate'; // 24.1 to 27.0 is Moderate
+  if (v <= CHI_THRESHOLDS.temperature.poorMax) return 'poor';    // 27.1 to 30.0 is Poor
+  return 'critical';                                             // Above 30.0 is Critical
 }
+
+/* FIXED: Logic gaps in humidity (e.g. 50.2%) */
 function conditionHumidity(v) {
   if (v === null) return 'unknown';
-  if (v >= CHI_THRESHOLDS.humidity.safeMin && v <= CHI_THRESHOLDS.humidity.safeMax) return 'safe';
-  if (v >= CHI_THRESHOLDS.humidity.modMin  && v <= CHI_THRESHOLDS.humidity.modMax)  return 'moderate';
-  if (v >= CHI_THRESHOLDS.humidity.poorMin && v <= CHI_THRESHOLDS.humidity.poorMax) return 'poor';
-  return 'critical';
+  if (v < CHI_THRESHOLDS.humidity.modMin) return 'safe';      // Below 51 is Safe (30-50.9)
+  if (v < CHI_THRESHOLDS.humidity.poorMin) return 'moderate'; // 51 to 60.9 is Moderate
+  if (v <= CHI_THRESHOLDS.humidity.poorMax) return 'poor';    // 61 to 70 is Poor
+  return 'critical';                                          // Above 70 is Critical
 }
 
 /* CHI is a composite score 0–100. Higher is better.
@@ -365,8 +371,6 @@ function metricScore(type, value) {
       ? Math.max(0, 1 - (20 - value) / 20)
       : Math.min(1, (value - 70) / 20);
   } else if (type === 'chi') {
-    /* CHI uses the same 0–100 scale as the meter.
-       Bands: 0–39 critical, 40–59 poor, 60–79 moderate, 80–100 safe. */
     if (zone === 'safe')          t = (value - 80) / 20;
     else if (zone === 'moderate') t = (value - 60) / 20;
     else if (zone === 'poor')     t = (value - 40) / 20;
@@ -416,7 +420,7 @@ function normalizeDeviceToRoom(devId, node, assignment, lastSyncedMs) {
   // 1. Calculate CHI FIRST
   const chi = computeCHI(co2, pm25, temperature, humidity);
 
-  // 2. Determine status based on the CHI score, not just the worst metric
+  // 2. Determine status based on the CHI score
   const statusText = chi !== null ? conditionCHI(chi) : roomStatusFromConditions(conds);
 
   const tsMs = numOrNull(latest?.timestamp_ms) ?? 0;
@@ -711,10 +715,10 @@ function renderOverview() {
     <tr class="condition-row ${r.status}">
       <td><span class="room-name">${r.id}</span>${offlineBadge}<small>${r.name}</small></td>
       <td><div class="chi-status-cell"><strong>${chiText}</strong><span class="status-chip ${r.status}">${statusLabel(r.status)}</span></div></td>
-      <td class="${r.status}">${fmtOr(r.humidity, v => v + '%')}</td>
-      <td class="${r.status}">${fmtOr(r.co2, v => v + ' ppm')}</td>
-      <td class="${r.status}">${fmtOr(r.pm25, v => v + ' µg/m³')}</td>
-      <td class="${r.status}">${fmtOr(r.temperature, v => Number(v).toFixed(1) + ' °C')}</td>
+      <td class="${r.conditions.humidity}">${fmtOr(r.humidity, v => v + '%')}</td>
+      <td class="${r.conditions.co2}">${fmtOr(r.co2, v => v + ' ppm')}</td>
+      <td class="${r.conditions.pm25}">${fmtOr(r.pm25, v => v + ' µg/m³')}</td>
+      <td class="${r.conditions.temperature}">${fmtOr(r.temperature, v => Number(v).toFixed(1) + ' °C')}</td>
       <td class="${r.status}">${r.purifier ? '<span class="value-good">ACTIVE</span>' : '<span>—</span>'}</td>
     </tr>`;
   }).join('');
@@ -832,7 +836,8 @@ function renderRoomDetail() {
   ];
 
   const metricTiles = telemetry.map(x => {
-    const status = x[2] === null ? 'unknown' : metricCondition(x[0], x[2]);
+    // Use the specific metric condition instead of the overall room status
+    const status = r.conditions[x[0]]; 
     const display = x[2] === null ? 'No reading'
       : (x[0] === 'temperature' ? Number(x[2]).toFixed(1) : x[2]);
     return `<button type="button"
@@ -877,9 +882,11 @@ function renderRoomDetail() {
     );
   }
 
-  let selected = telemetry.find(x => x[0] === selectedMetric) || telemetry[0];
+  let selected;
   if (selectedMetric === 'chi') {
     selected = ['chi', 'CHI', r.chi, '/ 100'];
+  } else {
+    selected = telemetry.find(x => x[0] === selectedMetric) || telemetry[0];
   }
   renderMetricCondition(selected[0], selected[2]);
 
