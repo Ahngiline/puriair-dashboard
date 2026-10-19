@@ -1,18 +1,9 @@
 /*
-  PURIAIR FRONTEND v19 — Cleaned & Fixed
+  PURIAIR FRONTEND v20 — Allow Empty Classrooms
   -------------------------------------------------------------------
-  Schema read from Firebase:
-    devices/<device_id>/latest/<field>
-    devices/<device_id>/control/<field>
-    devices/<device_id>/status/<field>
-    devices/<device_id>/readings/<YYYY-MM-DD>/<HH-MM-SS>
-    assignments/<classroom_id>/<field>
-
-  v19 CHANGES
-  - Fixed gap in conditionHumidity and conditionTemperature logic.
-  - Default selected metric set to 'chi'.
-  - Room status badges strictly follow the CHI score.
-  - Removed dead code, unused variables, and unused DOM queries.
+  v20 CHANGES
+  - Removed the restriction preventing the removal of the last classroom.
+  - The dashboard now gracefully handles 0 classrooms by showing empty states.
 */
 
 /* =========================================================
@@ -275,8 +266,6 @@ function conditionPM25(v) {
   if (v <= CHI_THRESHOLDS.pm25.poor)     return 'poor';
   return 'critical';
 }
-
-/* FIXED: Logic gaps in temperature (e.g. 24.05°C) */
 function conditionTemperature(v) {
   if (v === null) return 'unknown';
   if (v < CHI_THRESHOLDS.temperature.modMin) return 'safe';
@@ -284,8 +273,6 @@ function conditionTemperature(v) {
   if (v <= CHI_THRESHOLDS.temperature.poorMax) return 'poor';
   return 'critical';
 }
-
-/* FIXED: Logic gaps in humidity (e.g. 50.2%) */
 function conditionHumidity(v) {
   if (v === null) return 'unknown';
   if (v < CHI_THRESHOLDS.humidity.modMin) return 'safe';
@@ -293,9 +280,6 @@ function conditionHumidity(v) {
   if (v <= CHI_THRESHOLDS.humidity.poorMax) return 'poor';
   return 'critical';
 }
-
-/* CHI is a composite score 0–100. Higher is better.
-   80–100 safe, 60–79 moderate, 40–59 poor, 0–39 critical. */
 function conditionCHI(v) {
   if (v === null) return 'unknown';
   if (v >= 80) return 'safe';
@@ -312,7 +296,6 @@ function roomStatusFromConditions(conds) {
   return 'safe';
 }
 
-/* Zone-aligned meter position. */
 function metricScore(type, value) {
   if (value === null) return null;
 
@@ -369,7 +352,6 @@ function metricScore(type, value) {
   return z.start + t * (z.end - z.start);
 }
 
-/* CHI = average of per-metric condition points. */
 function computeCHI(co2, pm25, temp, humidity) {
   const conds = [
     conditionCO2(co2),
@@ -737,6 +719,14 @@ function renderClassrooms() {
   if (!classrooms.length) {
     if (roomSel) roomSel.innerHTML = '<option>No classrooms assigned</option>';
     if (cards)   cards.innerHTML = '<div class="panel" style="padding:20px;color:#999;text-align:center">No PuriAir devices have been paired with a classroom yet, or assigned devices have never published to Firebase.</div>';
+    
+    // Clear the focused telemetry view
+    const t = $('#detailRoomTitle'); if (t) t.textContent = 'No classroom assigned';
+    const chi = $('#detailCHI'); if (chi) chi.textContent = '--';
+    const grid = $('#detailTelemetry');
+    if (grid) grid.innerHTML = '';
+    const act = $('#studentPurifierActivity'); if (act) act.innerHTML = '<i></i> PURIFIER —';
+    
     return;
   }
 
@@ -1757,7 +1747,7 @@ function confirmAddClassroom() {
 }
 function confirmRemoveClassroom() {
   if (!isAdmin()) return;
-  if (classrooms.length <= 1) { showToast('Cannot remove', 'At least one classroom must remain.'); return; }
+  
   const id = $('#removeClassroomSelect').value;
   const assignments = loadAssignments();
   if (!assignments[id]) { showToast('Not found', 'Classroom not assigned.'); return; }
