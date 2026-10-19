@@ -1,5 +1,5 @@
 /*
-  PURIAIR FRONTEND v18 — Threshold & Metric Fix
+  PURIAIR FRONTEND v19 — Cleaned & Fixed
   -------------------------------------------------------------------
   Schema read from Firebase:
     devices/<device_id>/latest/<field>
@@ -8,13 +8,11 @@
     devices/<device_id>/readings/<YYYY-MM-DD>/<HH-MM-SS>
     assignments/<classroom_id>/<field>
 
-  v18 CHANGES
+  v19 CHANGES
   - Fixed gap in conditionHumidity and conditionTemperature logic.
-    Values like 50.2% or 24.05°C previously fell through the cracks
-    and defaulted to CRITICAL. They now correctly evaluate as MODERATE.
-  - Default selected metric set to 'chi' so the dashboard opens
-    showing the composite CHI score rather than humidity.
-  - Room status badges now strictly follow the CHI score.
+  - Default selected metric set to 'chi'.
+  - Room status badges strictly follow the CHI score.
+  - Removed dead code, unused variables, and unused DOM queries.
 */
 
 /* =========================================================
@@ -34,7 +32,6 @@ const FIREBASE_CONFIG = {
 
 let db = null;
 let firebaseReady = false;
-let firebaseAuthReady = false;
 
 const DEVICE_FRESH_MS = 120000;
 const STALE_WARN_MS   = 5 * 60 * 1000;
@@ -80,9 +77,8 @@ const CONDITION_POINTS = {
    ========================================================= */
 let classrooms     = [];
 let selectedRoom   = '';
-let selectedMetric = 'chi'; // Default to CHI score
+let selectedMetric = 'chi';
 let currentRole    = 'student';
-let lastFirebaseSnapshot = 0;
 let rawFirebaseDevices = {};
 
 let serverTimeOffset = 0;
@@ -111,7 +107,6 @@ const $$ = s => [...document.querySelectorAll(s)];
 const room    = () => classrooms.find(r => r.id === selectedRoom) || classrooms[0] || null;
 const isAdmin = () => currentRole === 'admin';
 const statusLabel = s => (s || 'unknown').toUpperCase();
-const currentPage = () => $('.nav-item.active')?.dataset.page || 'puriair';
 
 function now() {
   return Date.now() + serverTimeOffset;
@@ -179,14 +174,8 @@ function attachAssignmentListener() {
   });
 }
 
-function saveAvailableDevicesCache(list) {
-  try { localStorage.setItem(AVAILABLE_DEVICES_KEY, JSON.stringify(list)); } catch {}
-}
-function assignedDeviceIds() {
-  return Object.values(loadAssignments()).map(x => x.deviceId).filter(Boolean);
-}
 function availableDeviceIds() {
-  const assigned = new Set(assignedDeviceIds());
+  const assigned = new Set(Object.values(loadAssignments()).map(x => x.deviceId).filter(Boolean));
   return Object.keys(rawFirebaseDevices).filter(id => !assigned.has(id));
 }
 
@@ -208,7 +197,6 @@ function initFirebase() {
       firebase.auth().onAuthStateChanged(user => {
         if (user) {
           console.log('[PuriAir] Firebase auth ready. UID:', user.uid);
-          firebaseAuthReady = true;
           attachFirebaseListeners();
           attachAssignmentListener();
         } else {
@@ -291,19 +279,19 @@ function conditionPM25(v) {
 /* FIXED: Logic gaps in temperature (e.g. 24.05°C) */
 function conditionTemperature(v) {
   if (v === null) return 'unknown';
-  if (v < CHI_THRESHOLDS.temperature.modMin) return 'safe';   // Below 24.1 is Safe
-  if (v < CHI_THRESHOLDS.temperature.poorMin) return 'moderate'; // 24.1 to 27.0 is Moderate
-  if (v <= CHI_THRESHOLDS.temperature.poorMax) return 'poor';    // 27.1 to 30.0 is Poor
-  return 'critical';                                             // Above 30.0 is Critical
+  if (v < CHI_THRESHOLDS.temperature.modMin) return 'safe';
+  if (v < CHI_THRESHOLDS.temperature.poorMin) return 'moderate';
+  if (v <= CHI_THRESHOLDS.temperature.poorMax) return 'poor';
+  return 'critical';
 }
 
 /* FIXED: Logic gaps in humidity (e.g. 50.2%) */
 function conditionHumidity(v) {
   if (v === null) return 'unknown';
-  if (v < CHI_THRESHOLDS.humidity.modMin) return 'safe';      // Below 51 is Safe (30-50.9)
-  if (v < CHI_THRESHOLDS.humidity.poorMin) return 'moderate'; // 51 to 60.9 is Moderate
-  if (v <= CHI_THRESHOLDS.humidity.poorMax) return 'poor';    // 61 to 70 is Poor
-  return 'critical';                                          // Above 70 is Critical
+  if (v < CHI_THRESHOLDS.humidity.modMin) return 'safe';
+  if (v < CHI_THRESHOLDS.humidity.poorMin) return 'moderate';
+  if (v <= CHI_THRESHOLDS.humidity.poorMax) return 'poor';
+  return 'critical';
 }
 
 /* CHI is a composite score 0–100. Higher is better.
@@ -417,10 +405,7 @@ function normalizeDeviceToRoom(devId, node, assignment, lastSyncedMs) {
     conditionHumidity(humidity)
   ];
 
-  // 1. Calculate CHI FIRST
   const chi = computeCHI(co2, pm25, temperature, humidity);
-
-  // 2. Determine status based on the CHI score
   const statusText = chi !== null ? conditionCHI(chi) : roomStatusFromConditions(conds);
 
   const tsMs = numOrNull(latest?.timestamp_ms) ?? 0;
@@ -455,13 +440,6 @@ function normalizeDeviceToRoom(devId, node, assignment, lastSyncedMs) {
       device_id: latest?.deviceId || devId,
       uptime_ms: numOrNull(latest?.device_uptime_ms) ?? 0,
       raw: { latest, control, status }
-    },
-    control: {
-      mode: control?.mode || null,
-      power: control?.power === true,
-      purifierFan: control?.purifierFan === true,
-      humidifier: control?.humidifier === true,
-      dehumidifier: control?.dehumidifier === true
     }
   };
 }
@@ -580,9 +558,7 @@ function attachFirebaseListeners() {
 
   db.ref('devices').on('value', snap => {
     rawFirebaseDevices = snap.val() || {};
-    saveAvailableDevicesCache(Object.keys(rawFirebaseDevices));
     buildClassroomsFromAssignments();
-    lastFirebaseSnapshot = now();
 
     const state = computeGlobalStatus();
     const labelMap = {
@@ -618,7 +594,9 @@ function applyRole() {
     loginBtn.textContent = admin ? 'Logout' : 'Login';
     loginBtn.classList.toggle('logged-in', admin);
   }
-  if (!admin && ADMIN_ONLY_PAGES.includes(currentPage())) navigate('overview');
+  
+  const activePage = $('.nav-item.active')?.dataset.page || 'puriair';
+  if (!admin && ADMIN_ONLY_PAGES.includes(activePage)) navigate('overview');
 
   applyControlToUi();
 }
@@ -836,7 +814,6 @@ function renderRoomDetail() {
   ];
 
   const metricTiles = telemetry.map(x => {
-    // Use the specific metric condition instead of the overall room status
     const status = r.conditions[x[0]]; 
     const display = x[2] === null ? 'No reading'
       : (x[0] === 'temperature' ? Number(x[2]).toFixed(1) : x[2]);
@@ -851,7 +828,6 @@ function renderRoomDetail() {
     </button>`;
   }).join('');
 
-  /* CHI tile — treated as a composite metric alongside the four raw ones. */
   const chiStatus  = r.chi === null ? 'unknown' : conditionCHI(r.chi);
   const chiDisplay = r.chi === null ? 'No reading' : r.chi;
   const chiTile = `<button type="button"
@@ -1172,11 +1148,6 @@ function renderSensors() {
 
   if ($('#sensorCheckedAt')) $('#sensorCheckedAt').textContent =
     `Updated ${new Date().toLocaleTimeString('en-PH', {hour:'2-digit', minute:'2-digit', second:'2-digit', hour12:false})}`;
-
-  const uptimeSum  = $('#sensorUptimeSummary');
-  const uptimeHist = $('#sensorUptimeHistory');
-  if (uptimeSum)  uptimeSum.innerHTML  = '';
-  if (uptimeHist) uptimeHist.innerHTML = '';
 }
 
 /* =========================================================
