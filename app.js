@@ -1,9 +1,20 @@
 /*
-  PURIAIR FRONTEND v20 — Allow Empty Classrooms
+  PURIAIR FRONTEND v22 — Correct Meter Direction
   -------------------------------------------------------------------
-  v20 CHANGES
-  - Removed the restriction preventing the removal of the last classroom.
-  - The dashboard now gracefully handles 0 classrooms by showing empty states.
+  v22 CHANGES
+  - metricScore() for CO₂ and PM2.5 now maps "lower raw value = better"
+    to the right side of the meter (was inverted). Rising pollution now
+    moves the arrow LEFT toward CRITICAL; falling pollution moves it
+    RIGHT toward SAFE. Temperature / humidity / CHI were already correct
+    and are unchanged.
+  - All LCD classification parity from v21 preserved (conditionCO2,
+    conditionPM25, conditionTemperature, conditionHumidity, conditionCHI,
+    plus the negative-sentinel guards).
+
+  v21 HISTORY
+  - CO₂ / PM2.5 boundary fixes at 700 ppm and 12 µg/m³.
+  - Inclusive-boundary rewrites of temperature / humidity classifiers.
+  - Negative sentinel guards (-1 / -50 -> unknown).
 */
 
 /* =========================================================
@@ -43,7 +54,7 @@ const PAGE_TITLES = {
 
 const ADMIN_ONLY_PAGES = ['settings', 'sensors', 'purifier', 'database'];
 
-/* CHI thresholds — match the official PuriAir table exactly */
+/* CHI thresholds — mirror LCD.ino zoneXxx() inclusive boundaries */
 const CHI_THRESHOLDS = {
   co2:         { safe: 700,  moderate: 1000, poor: 1500 },
   pm25:        { safe: 12,   moderate: 35,   poor: 55   },
@@ -252,36 +263,37 @@ function setFirebaseUiStatus(state, label) {
 /* =========================================================
    6. FIREBASE → CLASSROOMS SYNC
    ========================================================= */
+/* ---- LCD-aligned condition classifiers ---- */
 function conditionCO2(v) {
-  if (v === null) return 'unknown';
-  if (v <= CHI_THRESHOLDS.co2.safe)      return 'safe';
-  if (v <= CHI_THRESHOLDS.co2.moderate) return 'moderate';
-  if (v <= CHI_THRESHOLDS.co2.poor)     return 'poor';
+  if (v === null || v < 0) return 'unknown';
+  if (v < 700)  return 'safe';
+  if (v <= 1000) return 'moderate';
+  if (v <= 1500) return 'poor';
   return 'critical';
 }
 function conditionPM25(v) {
-  if (v === null) return 'unknown';
-  if (v <= CHI_THRESHOLDS.pm25.safe)      return 'safe';
-  if (v <= CHI_THRESHOLDS.pm25.moderate) return 'moderate';
-  if (v <= CHI_THRESHOLDS.pm25.poor)     return 'poor';
+  if (v === null || v < 0) return 'unknown';
+  if (v < 12)   return 'safe';
+  if (v <= 35)  return 'moderate';
+  if (v <= 55)  return 'poor';
   return 'critical';
 }
 function conditionTemperature(v) {
-  if (v === null) return 'unknown';
-  if (v < CHI_THRESHOLDS.temperature.modMin) return 'safe';
-  if (v < CHI_THRESHOLDS.temperature.poorMin) return 'moderate';
-  if (v <= CHI_THRESHOLDS.temperature.poorMax) return 'poor';
+  if (v === null || v < -50) return 'unknown';
+  if (v >= 20.0 && v <= 24.0) return 'safe';
+  if (v >= 24.1 && v <= 27.0) return 'moderate';
+  if (v >= 27.1 && v <= 30.0) return 'poor';
   return 'critical';
 }
 function conditionHumidity(v) {
-  if (v === null) return 'unknown';
-  if (v < CHI_THRESHOLDS.humidity.modMin) return 'safe';
-  if (v < CHI_THRESHOLDS.humidity.poorMin) return 'moderate';
-  if (v <= CHI_THRESHOLDS.humidity.poorMax) return 'poor';
+  if (v === null || v < 0) return 'unknown';
+  if (v >= 30 && v <= 50) return 'safe';
+  if (v >= 51 && v <= 60) return 'moderate';
+  if (v >= 61 && v <= 70) return 'poor';
   return 'critical';
 }
 function conditionCHI(v) {
-  if (v === null) return 'unknown';
+  if (v === null || v < 0) return 'unknown';
   if (v >= 80) return 'safe';
   if (v >= 60) return 'moderate';
   if (v >= 40) return 'poor';
@@ -296,6 +308,12 @@ function roomStatusFromConditions(conds) {
   return 'safe';
 }
 
+/* ---- Meter score ----
+   Returns a 0–100 position where:
+     0   = left edge   = worst
+     100 = right edge  = best
+   The arrow's `left` CSS uses this value directly, so higher score
+   always means the arrow is further right. */
 function metricScore(type, value) {
   if (value === null) return null;
 
@@ -314,18 +332,21 @@ function metricScore(type, value) {
   let t = 0.5;
 
   if (type === 'co2') {
+    // CO2: raw value RISES as air gets WORSE. Invert so low value => right.
     const T = CHI_THRESHOLDS.co2;
-    if (zone === 'safe')          t = Math.min(1, value / T.safe);
-    else if (zone === 'moderate') t = (value - T.safe)     / (T.moderate - T.safe);
-    else if (zone === 'poor')     t = (value - T.moderate) / (T.poor     - T.moderate);
-    else                          t = Math.min(1, (value - T.poor) / 500);
+    if (zone === 'safe')          t = 1 - Math.min(1, value / T.safe);
+    else if (zone === 'moderate') t = 1 - (value - T.safe)     / (T.moderate - T.safe);
+    else if (zone === 'poor')     t = 1 - (value - T.moderate) / (T.poor     - T.moderate);
+    else                          t = 1 - Math.min(1, (value - T.poor) / 500);
   } else if (type === 'pm25') {
+    // PM2.5: same direction as CO2. Invert.
     const T = CHI_THRESHOLDS.pm25;
-    if (zone === 'safe')          t = Math.min(1, value / T.safe);
-    else if (zone === 'moderate') t = (value - T.safe)     / (T.moderate - T.safe);
-    else if (zone === 'poor')     t = (value - T.moderate) / (T.poor     - T.moderate);
-    else                          t = Math.min(1, (value - T.poor) / 45);
+    if (zone === 'safe')          t = 1 - Math.min(1, value / T.safe);
+    else if (zone === 'moderate') t = 1 - (value - T.safe)     / (T.moderate - T.safe);
+    else if (zone === 'poor')     t = 1 - (value - T.moderate) / (T.poor     - T.moderate);
+    else                          t = 1 - Math.min(1, (value - T.poor) / 45);
   } else if (type === 'temperature') {
+    // Safe center = 22 °C. Both extremes penalized.
     const T = CHI_THRESHOLDS.temperature;
     if (zone === 'safe')          t = 0.5 + (value - 22) / 4;
     else if (zone === 'moderate') t = (value - T.modMin)  / (T.modMax  - T.modMin);
@@ -334,6 +355,7 @@ function metricScore(type, value) {
       ? Math.max(0, 1 - (18 - value) / 18)
       : Math.min(1, (value - 30) / 20);
   } else if (type === 'humidity') {
+    // Safe center = 40 %. Both extremes penalized.
     const T = CHI_THRESHOLDS.humidity;
     if (zone === 'safe')          t = 0.5 + (value - 40) / 20;
     else if (zone === 'moderate') t = (value - T.modMin)  / (T.modMax  - T.modMin);
@@ -342,6 +364,7 @@ function metricScore(type, value) {
       ? Math.max(0, 1 - (20 - value) / 20)
       : Math.min(1, (value - 70) / 20);
   } else if (type === 'chi') {
+    // CHI: higher is better. No inversion needed.
     if (zone === 'safe')          t = (value - 80) / 20;
     else if (zone === 'moderate') t = (value - 60) / 20;
     else if (zone === 'poor')     t = (value - 40) / 20;
@@ -720,7 +743,6 @@ function renderClassrooms() {
     if (roomSel) roomSel.innerHTML = '<option>No classrooms assigned</option>';
     if (cards)   cards.innerHTML = '<div class="panel" style="padding:20px;color:#999;text-align:center">No PuriAir devices have been paired with a classroom yet, or assigned devices have never published to Firebase.</div>';
     
-    // Clear the focused telemetry view
     const t = $('#detailRoomTitle'); if (t) t.textContent = 'No classroom assigned';
     const chi = $('#detailCHI'); if (chi) chi.textContent = '--';
     const grid = $('#detailTelemetry');
